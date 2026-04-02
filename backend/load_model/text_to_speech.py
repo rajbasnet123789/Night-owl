@@ -1,10 +1,7 @@
-import pyaudio
+import pyttsx3
 
-try:
-   p = pyaudio.PyAudio()
+engine = pyttsx3.init()
 
-except Exception as e:
-   print(e)
-
-   
-
+def speak(text):
+    engine.say(text)
+    engine.runAndWait()
