@@ -14,3 +14,5 @@ webrtcvad
 faster_whisper
 pyttsx3
 websockets
+python-multipart
+uvicorn

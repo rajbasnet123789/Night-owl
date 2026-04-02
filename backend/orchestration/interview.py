@@ -22,6 +22,7 @@ def build_graph():
     g.add_edge("search", "rag")
     g.add_edge("rag", "llm")
     g.add_edge("llm", "tts")
-    g.add_edge("tts", "stt")
+    
+    g.set_finish_point("tts")
 
     return g.compile()
