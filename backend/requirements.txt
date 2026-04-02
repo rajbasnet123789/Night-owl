@@ -1,7 +1,15 @@
 langgraph
-ipykernel
+langchain
+transformers
+torch
+SpeechRecognition
+pyaudio
+gtts
 tavily-python
+pinecone
+sentence-transformers
 python-dotenv
-huggingface_hub==0.36.2
---prerelease=allow moshi
-sounddevice
+orchestration
+webrtcvad
+faster_whisper
+pyttsx3

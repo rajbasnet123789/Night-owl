@@ -1,17 +1,27 @@
-from load_model.speech_to_text import client_stt
-from load_model.text_to_speech import client_tts
-from load_model.text_generation import client_tg
-from langgraph.graph import StateGraph, MessagesState, START, END
+from langgraph.graph import StateGraph
+from backend.orchestration.nodes import (
+    stt_node,
+    search_node,
+    rag_node,
+    llm_node,
+    tts_node
+)
 
+def build_graph():
+    g = StateGraph(dict)
 
-def mock_llm(state: MessagesState):
-    return {"messages": [{"role": "ai", "content": "hello world"}]}
+    g.add_node("stt", stt_node)
+    g.add_node("search", search_node)
+    g.add_node("rag", rag_node)
+    g.add_node("llm", llm_node)
+    g.add_node("tts", tts_node)
 
-graph = StateGraph(MessagesState)
-graph.add_node(mock_llm)
-graph.add_edge(START, "mock_llm")
-graph.add_edge("mock_llm", END)
-graph = graph.compile()
+    g.set_entry_point("stt")
 
-graph.invoke({"messages": [{"role": "user", "content": "hi!"}]})
+    g.add_edge("stt", "search")
+    g.add_edge("search", "rag")
+    g.add_edge("rag", "llm")
+    g.add_edge("llm", "tts")
+    g.add_edge("tts", "stt")
 
+    return g.compile()

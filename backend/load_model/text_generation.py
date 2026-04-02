@@ -1,7 +1,7 @@
 from transformers import pipeline
 
-generator = pipeline('text-generation', model='gpt2')
+generator = pipeline("text-generation", model="gpt2")
 
-
-output = generator("Hello, I'm a language model", max_length=30, num_return_sequences=1)
-print(output[0]['generated_text']) 
+def generate_text(prompt):
+    output = generator(prompt, max_length=120, num_return_sequences=1)
+    return output[0]["generated_text"]
