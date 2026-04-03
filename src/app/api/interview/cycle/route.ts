@@ -1,10 +1,76 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { buildInterviewSummary, type InterviewMessage } from "@/lib/interviewSummary";
 
 type Body = {
   sessionId?: unknown;
   transcript?: unknown;
 };
+
+type SessionMessage = {
+  role?: string;
+  text?: string;
+  kind?: string;
+  questions?: unknown;
+  qIndex?: unknown;
+  [key: string]: unknown;
+};
+
+function isWarmupTranscript(text: string) {
+  return /start the interview with the first question|i just studied .*start the interview/i.test(text);
+}
+
+function extractTopic(messages: SessionMessage[]) {
+  const system = messages.find((m) => m?.role === "system" && typeof m?.text === "string");
+  const txt = (system?.text || "").trim();
+  const match = txt.match(/\bTopic:\s*(.+)$/i);
+  return match?.[1]?.trim() || "";
+}
+
+function fallbackPlan(topic: string) {
+  const base = [
+    `What are the fundamental concepts of ${topic || "this topic"}?`,
+    `Can you explain one core architecture/pattern used in ${topic || "this topic"}?`,
+    `How would you implement a basic solution in ${topic || "this topic"}?`,
+    `What are common mistakes learners make in ${topic || "this topic"}?`,
+    `How would you debug a failure in ${topic || "this topic"}?`,
+    `What trade-offs are important in ${topic || "this topic"} design decisions?`,
+    `How would you optimize performance in ${topic || "this topic"}?`,
+    `How would you test correctness and reliability in ${topic || "this topic"}?`,
+    `What security or safety concerns apply to ${topic || "this topic"}?`,
+    `How would you explain ${topic || "this topic"} to a junior engineer?`,
+    `Describe a real-world use case where ${topic || "this topic"} is the right choice.`,
+    `What advanced concept in ${topic || "this topic"} would you learn next and why?`,
+  ];
+  return base;
+}
+
+function extractPlan(messages: SessionMessage[], topic: string) {
+  const planMsg = messages.find((m) => m?.role === "system" && m?.kind === "question_plan");
+  if (!planMsg || !Array.isArray(planMsg.questions)) {
+    return fallbackPlan(topic);
+  }
+
+  const questions = (planMsg.questions as unknown[])
+    .filter((q): q is string => typeof q === "string")
+    .map((q) => q.trim())
+    .filter(Boolean)
+    .slice(0, 20);
+
+  if (questions.length < 10) return fallbackPlan(topic);
+  return questions;
+}
+
+function countAskedQuestions(messages: SessionMessage[]) {
+  return messages.filter((m) => m?.role === "ai" && m?.kind === "question" && typeof m?.qIndex === "number").length;
+}
+
+function makeLeadIn(answer: string) {
+  const wc = answer.trim().split(/\s+/).filter(Boolean).length;
+  if (wc < 8) return "Noted. Add more depth in your next answer.";
+  if (wc > 80) return "Good detail. Keep the next one concise and structured.";
+  return "Good response. Let us move to the next question.";
+}
 
 export async function POST(req: Request) {
   try {
@@ -16,53 +82,83 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Missing sessionId/transcript" }, { status: 400 });
     }
 
-    const controller = new AbortController();
-    const timeoutMs = 15000;
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
     const existing = await prisma.interviewSession.findUnique({ where: { id: sessionId } });
-    let topic: string | null = null;
-    if (existing && Array.isArray(existing.messages)) {
-      const systemMsg = (existing.messages as any[]).find((m) => m && m.role === "system" && typeof m.text === "string");
-      const txt = typeof systemMsg?.text === "string" ? systemMsg.text : "";
-      const m = txt.match(/\bTopic:\s*(.+)$/i);
-      if (m && m[1]) topic = m[1].trim();
+
+    if (!existing) {
+      return NextResponse.json({ error: "Interview session not found" }, { status: 404 });
     }
 
-    const pyRes = await fetch("http://127.0.0.1:8000/api/interview_cycle", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      // Ask Python backend to prefer a low-latency path.
-      body: JSON.stringify({ transcript, mode: "fast", topic, session_id: sessionId }),
-      signal: controller.signal,
-    }).finally(() => clearTimeout(timeout));
+    const now = new Date().toISOString();
+    const messages = Array.isArray(existing.messages)
+      ? ((existing.messages as unknown[]) as SessionMessage[])
+      : [];
+    const topic = extractTopic(messages);
+    const plan = extractPlan(messages, topic);
+    const totalQuestions = Math.max(10, Math.min(20, plan.length));
+    const askedSoFar = countAskedQuestions(messages);
+    const warmup = isWarmupTranscript(transcript);
 
-    const pyData = await pyRes.json().catch(() => ({}));
-    if (!pyRes.ok) {
-      const detail = typeof pyData?.detail === "string" ? pyData.detail : "Python backend error";
-      return NextResponse.json({ error: detail }, { status: 502 });
+    const nextMessages: InterviewMessage[] = [...(messages as InterviewMessage[])];
+    if (!warmup) {
+      nextMessages.push({ role: "user", text: transcript.trim(), ts: now });
     }
 
-    const responseText = typeof pyData.response_text === "string" ? pyData.response_text : "";
-    const audioUrl = typeof pyData.audio_url === "string" ? pyData.audio_url : null;
+    // End only when all planned questions are already asked and user answered the last one.
+    if (askedSoFar >= totalQuestions && !warmup) {
+      const summaryDone = buildInterviewSummary(nextMessages, topic || undefined, {
+        targetQuestions: totalQuestions,
+        forceComplete: true,
+      });
+      nextMessages.push({
+        role: "ai",
+        kind: "final_feedback",
+        text: summaryDone.finalFeedback,
+        ts: now,
+      } as InterviewMessage);
 
-    // Append messages to DB (best-effort).
-    if (existing) {
-      const messages = Array.isArray((existing as any).messages) ? ((existing as any).messages as any[]) : [];
-      const now = new Date().toISOString();
-      messages.push({ role: "user", text: transcript, ts: now });
-      messages.push({ role: "ai", text: responseText, ts: now });
-      await prisma.interviewSession.update({ where: { id: sessionId }, data: { messages } });
+      await prisma.interviewSession.update({
+        where: { id: sessionId },
+        data: { status: "ended", endedAt: new Date(), messages: nextMessages },
+      });
+
+      return NextResponse.json({
+        response_text: summaryDone.finalFeedback,
+        audio_url: null,
+        is_complete: true,
+        total_questions: totalQuestions,
+        asked_questions: totalQuestions,
+        remaining_questions: 0,
+        summary: summaryDone,
+      });
     }
 
-    return NextResponse.json({ response_text: responseText, audio_url: audioUrl });
+    const nextQuestion = plan[Math.min(askedSoFar, totalQuestions - 1)] || plan[0];
+    const leadIn = warmup ? "Interview initialized from your studied content." : makeLeadIn(transcript);
+    const responseText = `${leadIn} Question ${Math.min(askedSoFar + 1, totalQuestions)}/${totalQuestions}: ${nextQuestion}`;
+
+    nextMessages.push({
+      role: "ai",
+      kind: "question",
+      qIndex: Math.min(askedSoFar + 1, totalQuestions),
+      text: responseText,
+      ts: now,
+    } as InterviewMessage);
+
+    await prisma.interviewSession.update({ where: { id: sessionId }, data: { messages: nextMessages } });
+    const summary = buildInterviewSummary(nextMessages, topic || undefined, {
+      targetQuestions: totalQuestions,
+    });
+
+    return NextResponse.json({
+      response_text: responseText,
+      audio_url: null,
+      is_complete: false,
+      total_questions: totalQuestions,
+      asked_questions: Math.min(askedSoFar + 1, totalQuestions),
+      remaining_questions: Math.max(0, totalQuestions - Math.min(askedSoFar + 1, totalQuestions)),
+      summary,
+    });
   } catch (error: unknown) {
-    if (error instanceof Error && error.name === "AbortError") {
-      return NextResponse.json(
-        { error: "Interview backend timed out. Try a shorter reply." },
-        { status: 504 }
-      );
-    }
     const message = error instanceof Error ? error.message : "Unknown error";
     return NextResponse.json({ error: message }, { status: 500 });
   }

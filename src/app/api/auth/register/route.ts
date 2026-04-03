@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { prisma } from "@/lib/prisma";
+import { getDatabaseApiError, prisma } from "@/lib/prisma";
 import { createLoginSession, hashPassword } from "@/lib/auth";
 
 type RegisterBody = {
@@ -37,6 +37,11 @@ export async function POST(req: Request) {
 
     return NextResponse.json({ user });
   } catch (error: unknown) {
+    const dbError = getDatabaseApiError(error);
+    if (dbError) {
+      return NextResponse.json({ error: dbError }, { status: 503 });
+    }
+
     const message = error instanceof Error ? error.message : "Unknown error";
     return NextResponse.json({ error: message }, { status: 500 });
   }

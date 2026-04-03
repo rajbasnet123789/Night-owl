@@ -1,9 +1,27 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { motion } from "framer-motion";
-import { Mic, Square, Loader2, Bot, ArrowLeft, Activity, User, ShieldAlert } from "lucide-react";
+import { Loader2, Bot, ArrowLeft, Activity, User, ShieldAlert, TrendingUp } from "lucide-react";
+import FocusMonitor from "@/components/FocusMonitor";
+import { upsertInterviewTaskHistory } from "@/lib/interviewTaskHistory";
+import { completeInterviewMentorshipTask } from "@/lib/mentorshipPlan";
+
+type InterviewSummary = {
+  topic: string;
+  coveredQuestions: number;
+  targetQuestions: number;
+  averageWordsPerAnswer: number;
+  conciseAnswerRatio: number;
+  efficiencyScore: number;
+  complete: boolean;
+  reason: string;
+  strengths: string[];
+  gaps: string[];
+  improvementSteps: string[];
+  finalFeedback: string;
+};
 
 function normalizeTranscript(input: string): string {
   const trimmed = input.replace(/\s+/g, " ").trim();
@@ -48,30 +66,6 @@ function speakText(text: string) {
   }
 }
 
-async function speakViaDeepgram(text: string): Promise<boolean> {
-  // Note: caller should prevent overlaps by stopping any previous audio.
-  try {
-    const cleaned = text.replace(/\s+/g, " ").trim();
-    if (!cleaned) return false;
-
-    const res = await fetch("/api/deepgram/tts", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: cleaned }),
-    });
-
-    if (!res.ok) return false;
-    const audioBlob = await res.blob();
-    const url = URL.createObjectURL(audioBlob);
-    const audio = new Audio(url);
-    audio.onended = () => URL.revokeObjectURL(url);
-    await audio.play();
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 export default function InterviewPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -87,6 +81,13 @@ export default function InterviewPage() {
   const [sessionStarting, setSessionStarting] = useState(false);
   const [sessionEnding, setSessionEnding] = useState(false);
   const [sessionError, setSessionError] = useState<string | null>(null);
+  const [finalSummary, setFinalSummary] = useState<InterviewSummary | null>(null);
+  const [sttStatus, setSttStatus] = useState<"idle" | "listening" | "transcribing">("idle");
+  const [questionProgress, setQuestionProgress] = useState<{ total: number; asked: number; remaining: number }>({
+    total: 10,
+    asked: 0,
+    remaining: 10,
+  });
   const [contextStatus, setContextStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [contextSource, setContextSource] = useState<string>("");
   const [uploadedNotesText, setUploadedNotesText] = useState<string>("");
@@ -104,12 +105,161 @@ export default function InterviewPage() {
   const sttInFlightRef = useRef(false);
   const sttQueuedRef = useRef(false);
   const sttCooldownUntilRef = useRef<number>(0);
+  const recorderMimeTypeRef = useRef<string>("audio/webm");
+  const lastSpeechAtRef = useRef<number>(0);
+  const lastPresencePromptAtRef = useRef<number>(0);
+  const suppressStopProcessingRef = useRef(false);
+  const startRecordingRef = useRef<() => Promise<void>>(async () => undefined);
+  const processAudioRef = useRef<(transcript: string) => Promise<void>>(async () => undefined);
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
   const ttsAudioUrlRef = useRef<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const [videoId, setVideoId] = useState<string>("");
+
+  const transcribeBlob = async (blob: Blob): Promise<string> => {
+    if (!blob || blob.size < 2_000) return "";
+    const mime = (blob.type || recorderMimeTypeRef.current || "audio/webm").trim();
+    const ext = mime.includes("ogg") ? "ogg" : mime.includes("mp4") ? "mp4" : "webm";
+    const file = new File([blob], `audio.${ext}`, { type: mime });
+    const fd = new FormData();
+    fd.append("audio", file);
+
+    const res = await fetch("/api/deepgram/stt", { method: "POST", body: fd });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const msg = typeof (data as { error?: unknown })?.error === "string" ? (data as { error: string }).error : "STT failed";
+      throw new Error(msg);
+    }
+
+    return typeof (data as { transcript?: unknown }).transcript === "string"
+      ? (data as { transcript: string }).transcript.trim()
+      : "";
+  };
+
+  const performance = useMemo(() => {
+    const userMessages = logs.filter((item) => item.role === "user");
+    const answered = userMessages.length;
+    const totalWords = userMessages.reduce((sum, item) => {
+      const words = item.text.trim().split(/\s+/).filter(Boolean).length;
+      return sum + words;
+    }, 0);
+    const averageWords = answered > 0 ? Math.round(totalWords / answered) : 0;
+    const conciseAnswers = userMessages.filter((item) => {
+      const words = item.text.trim().split(/\s+/).filter(Boolean).length;
+      return words >= 8 && words <= 45;
+    }).length;
+    const conciseRatio = answered > 0 ? conciseAnswers / answered : 0;
+
+    const progressPercent =
+      questionProgress.total > 0
+        ? Math.min(100, Math.round((questionProgress.asked / questionProgress.total) * 100))
+        : 0;
+    const baseEfficiency = Math.min(100, 40 + answered * 10 + Math.round(conciseRatio * 35));
+    const cameraPenalty = proctorEnabled && cameraStatus === "blocked" ? 12 : 0;
+    const efficiency = Math.max(0, baseEfficiency - cameraPenalty);
+
+    const communicationFeedback =
+      averageWords === 0
+        ? "Start with one clear, specific answer to calibrate your baseline."
+        : averageWords < 10
+          ? "Expand answers with one concrete example to improve depth."
+          : averageWords > 60
+            ? "Trim long responses; keep key points first for better clarity."
+            : "Balanced answer length. Keep this structure for consistency.";
+
+    const momentumFeedback =
+      answered >= 5
+        ? "Great rhythm. You are sustaining interview pace."
+        : answered >= 3
+          ? "Good momentum. Complete a few more rounds for stronger signal."
+          : "Early stage. Finish more Q&A turns to build reliable metrics.";
+
+    return {
+      answered,
+      averageWords,
+      conciseRatio,
+      progressPercent,
+      efficiency,
+      communicationFeedback,
+      momentumFeedback,
+    };
+  }, [logs, proctorEnabled, cameraStatus, questionProgress]);
+
+  const syncProgressFromData = (
+    data: unknown,
+    fallbackAsked?: number
+  ) => {
+    const payload = (data || {}) as {
+      total_questions?: unknown;
+      asked_questions?: unknown;
+      remaining_questions?: unknown;
+    };
+
+    const total = typeof payload.total_questions === "number" ? payload.total_questions : questionProgress.total;
+    const asked = typeof payload.asked_questions === "number" ? payload.asked_questions : (fallbackAsked ?? questionProgress.asked);
+    const remaining = typeof payload.remaining_questions === "number"
+      ? payload.remaining_questions
+      : Math.max(0, total - asked);
+
+    setQuestionProgress({
+      total: Math.max(10, Math.min(20, total || 10)),
+      asked: Math.max(0, asked),
+      remaining: Math.max(0, remaining),
+    });
+  };
+
+  const persistCompletedTask = (summary: InterviewSummary, activeSessionId: string, payload?: unknown) => {
+    const data = (payload || {}) as {
+      total_questions?: unknown;
+      asked_questions?: unknown;
+    };
+
+    const totalFromPayload = typeof data.total_questions === "number" ? data.total_questions : questionProgress.total;
+    const askedFromPayload = typeof data.asked_questions === "number" ? data.asked_questions : questionProgress.asked;
+
+    upsertInterviewTaskHistory({
+      sessionId: activeSessionId,
+      topic,
+      summary,
+      fallbackPerformance: {
+        answered: performance.answered,
+        averageWords: performance.averageWords,
+        conciseRatio: performance.conciseRatio,
+        efficiency: performance.efficiency,
+        progressPercent:
+          totalFromPayload > 0
+            ? Math.min(100, Math.round((askedFromPayload / totalFromPayload) * 100))
+            : performance.progressPercent,
+      },
+      fallbackQuestionProgress: {
+        asked: askedFromPayload,
+        total: totalFromPayload,
+      },
+    });
+
+    const rating = Math.max(0, Math.min(5, Math.round((summary.efficiencyScore / 20) * 10) / 10));
+    completeInterviewMentorshipTask({
+      feedback: summary.finalFeedback,
+      rating,
+    });
+  };
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        "study.interview.performance",
+        JSON.stringify({
+          ...performance,
+          topic,
+          updatedAt: new Date().toISOString(),
+        })
+      );
+    } catch {
+      // ignore storage failures
+    }
+  }, [performance, topic]);
 
   useEffect(() => {
     // Prefer URL param; fall back to localStorage (set by the Learn page).
@@ -242,16 +392,24 @@ export default function InterviewPage() {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error((data as any).error || "Interview start failed");
+    syncProgressFromData(data, 1);
 
     const responseText = typeof (data as any).response_text === "string" ? (data as any).response_text : "";
     if (responseText.trim()) {
       setLogs((prev) => [...prev, { role: "ai", text: responseText.trim() }]);
+      lastSpeechAtRef.current = Date.now();
     }
   };
 
   const startSession = async () => {
     if (sessionStarting || sessionId) return;
+    if (proctorEnabled && cameraStatus !== "enabled") {
+      setSessionError("Proctored interview requires active camera/retina scanner before starting.");
+      return;
+    }
     setSessionError(null);
+    setFinalSummary(null);
+    setQuestionProgress({ total: 10, asked: 0, remaining: 10 });
     setSessionStarting(true);
     setContextStatus("idle");
     try {
@@ -295,6 +453,7 @@ export default function InterviewPage() {
     try {
       if (isRecording) {
         try {
+          suppressStopProcessingRef.current = true;
           mediaRecorderRef.current?.stop();
         } catch {
           // ignore
@@ -308,8 +467,15 @@ export default function InterviewPage() {
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error((data as any).error || "Failed to end session");
+      const maybeSummary = (data as { summary?: InterviewSummary }).summary;
+      if (maybeSummary) {
+        setFinalSummary(maybeSummary);
+        persistCompletedTask(maybeSummary, sessionId, data);
+      }
+      syncProgressFromData(data);
       setSessionId(null);
       sessionIdRef.current = null;
+      setSttStatus("idle");
     } catch (e) {
       setSessionError(e instanceof Error ? e.message : "Failed to end session");
     } finally {
@@ -335,6 +501,10 @@ export default function InterviewPage() {
       setSessionError("Click 'Start Interview' first.");
       return;
     }
+    if (proctorEnabled && cameraStatus !== "enabled") {
+      setSessionError("Camera must stay active in proctored mode.");
+      return;
+    }
     if (contextStatus !== "ready") {
       setSessionError("Preparing interview context… please wait.");
       return;
@@ -355,12 +525,14 @@ export default function InterviewPage() {
         }
       });
       const mediaRecorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      recorderMimeTypeRef.current = mediaRecorder.mimeType || mimeType || "audio/webm";
       mediaRecorderRef.current = mediaRecorder;
       audioChunksRef.current = [];
       liveTranscriptRef.current = "";
+      setSttStatus("listening");
 
       const transcribeChunk = async (blob: Blob) => {
-        if (!blob || blob.size < 512) return;
+        if (!blob || blob.size < 4_000) return;
         const now = Date.now();
         if (now < sttCooldownUntilRef.current) return;
         if (sttInFlightRef.current) {
@@ -370,22 +542,26 @@ export default function InterviewPage() {
 
         sttInFlightRef.current = true;
         try {
-          const fd = new FormData();
-          fd.append("audio", blob, "chunk.webm");
-          const res = await fetch("/api/deepgram/stt", { method: "POST", body: fd });
-          const data = await res.json().catch(() => ({}));
-          if (!res.ok) {
-            const msg = typeof (data as any)?.error === "string" ? (data as any).error : "STT failed";
-            // brief cooldown so we don't spam Deepgram if it rejects/limits.
-            sttCooldownUntilRef.current = Date.now() + 3500;
-            setSessionError(`STT error: ${msg}`);
+          setSttStatus("transcribing");
+          const t = await transcribeBlob(blob);
+          if (!t) {
+            setSttStatus("listening");
             return;
           }
-          const t = typeof (data as any).transcript === "string" ? (data as any).transcript.trim() : "";
-          if (!t) return;
 
           liveTranscriptRef.current = `${liveTranscriptRef.current} ${t}`.replace(/\s+/g, " ").trim();
           setMockTranscript(liveTranscriptRef.current);
+          lastSpeechAtRef.current = Date.now();
+          setSttStatus("listening");
+          setSessionError(null);
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : "STT failed";
+          const unsupported = /corrupt|unsupported data|failed to process audio/i.test(msg);
+          sttCooldownUntilRef.current = Date.now() + (unsupported ? 5_000 : 3_500);
+          if (!unsupported) {
+            setSessionError(`STT error: ${msg}`);
+          }
+          setSttStatus("listening");
         } finally {
           sttInFlightRef.current = false;
           if (sttQueuedRef.current) {
@@ -403,8 +579,7 @@ export default function InterviewPage() {
       };
 
       mediaRecorder.onstop = async () => {
-        // In this demo flow we don’t upload audio yet; we use the text box as the transcript.
-        new Blob(audioChunksRef.current, { type: 'audio/webm' });
+        const completeBlob = new Blob(audioChunksRef.current, { type: recorderMimeTypeRef.current || "audio/webm" });
         setIsRecording(false);
 
         try {
@@ -413,30 +588,44 @@ export default function InterviewPage() {
           // ignore
         }
         streamRef.current = null;
+        setSttStatus("idle");
 
-        const bestTranscript = liveTranscriptRef.current.trim() || mockTranscript;
-        const normalized = normalizeTranscript(bestTranscript) || "Testing audio processor pipeline.";
-        await processAudioMock(normalized);
+        if (suppressStopProcessingRef.current) {
+          suppressStopProcessingRef.current = false;
+          return;
+        }
+
+        let bestTranscript = liveTranscriptRef.current.trim() || mockTranscript.trim();
+        if (!bestTranscript && completeBlob.size >= 6_000) {
+          try {
+            setSttStatus("transcribing");
+            bestTranscript = await transcribeBlob(completeBlob);
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : "STT failed";
+            setSessionError(`STT error: ${msg}`);
+          } finally {
+            setSttStatus("idle");
+          }
+        }
+
+        const normalized = normalizeTranscript(bestTranscript);
+        if (normalized) {
+          liveTranscriptRef.current = "";
+          setMockTranscript("");
+          await processAudioMock(normalized);
+        }
       };
 
       // timeslice gives near-real-time chunks
-      mediaRecorder.start(1400);
+      mediaRecorder.start(2500);
+      lastSpeechAtRef.current = Date.now();
+      lastPresencePromptAtRef.current = 0;
       setIsRecording(true);
     } catch (err) {
       console.error(err);
-      setIsRecording(true); // Mock mode if permission denied
-    }
-  };
-
-  const stopRecording = () => {
-    if (mediaRecorderRef.current) {
-      mediaRecorderRef.current.stop();
       setIsRecording(false);
-    } else {
-       // Mock fallback
-       setIsRecording(false);
-       const normalized = normalizeTranscript(mockTranscript) || "Testing audio processor pipeline.";
-       processAudioMock(normalized);
+      setSttStatus("idle");
+      setSessionError("Microphone access failed. Allow mic permission for speech-to-text.");
     }
   };
 
@@ -450,15 +639,19 @@ export default function InterviewPage() {
     
     try {
         if (!sessionId) throw new Error("Session not initialized");
+        const activeSessionId = sessionId;
         const res = await fetch("/api/interview/cycle", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ transcript: normalized, sessionId })
+          body: JSON.stringify({ transcript: normalized, sessionId: activeSessionId })
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || "Interview cycle failed");
 
         const responseText = typeof data.response_text === "string" ? data.response_text : "";
+        const maybeSummary = (data as { summary?: InterviewSummary }).summary;
+        const isComplete = (data as { is_complete?: boolean }).is_complete === true;
+        syncProgressFromData(data);
         const aiIndex = newLogs.length;
         setLogs([...newLogs, { role: 'ai', text: "" }]);
         setIsTypingReply(true);
@@ -513,12 +706,68 @@ export default function InterviewPage() {
           }
         })();
         if (!ok) speakText(responseText || "");
+
+        if (!isComplete) {
+          lastSpeechAtRef.current = Date.now();
+        }
+
+        if (isComplete) {
+          if (maybeSummary) {
+            setFinalSummary(maybeSummary);
+            persistCompletedTask(maybeSummary, activeSessionId, data);
+          }
+          syncProgressFromData(data, questionProgress.total);
+          setSessionId(null);
+          sessionIdRef.current = null;
+          setIsRecording(false);
+          setSttStatus("idle");
+          setSessionError(null);
+        }
     } catch (e) {
       setSessionError(e instanceof Error ? e.message : "Interview cycle failed");
         setLogs([...newLogs, { role: 'ai', text: "Error connecting to LangGraph Backend." }]);
     }
     setIsProcessing(false);
   };
+
+  startRecordingRef.current = startRecording;
+  processAudioRef.current = processAudioMock;
+
+  useEffect(() => {
+    if (!sessionId || contextStatus !== "ready") return;
+    if (proctorEnabled && cameraStatus !== "enabled") return;
+    if (isRecording || sessionEnding) return;
+    void startRecordingRef.current();
+  }, [sessionId, contextStatus, proctorEnabled, cameraStatus, isRecording, sessionEnding]);
+
+  useEffect(() => {
+    if (!sessionId || !isRecording) return;
+
+    const timer = setInterval(() => {
+      if (!sessionIdRef.current) return;
+      if (isProcessing || isTypingReply || sessionEnding) return;
+
+      const silentForMs = Date.now() - (lastSpeechAtRef.current || Date.now());
+      if (silentForMs < 15_000) return;
+
+      const buffered = normalizeTranscript(liveTranscriptRef.current);
+      if (buffered) {
+        liveTranscriptRef.current = "";
+        setMockTranscript("");
+        lastSpeechAtRef.current = Date.now();
+        void processAudioRef.current(buffered);
+        return;
+      }
+
+      if (Date.now() - lastPresencePromptAtRef.current < 30_000) return;
+      lastPresencePromptAtRef.current = Date.now();
+      const prompt = "I have not heard you for 15 seconds. Are you still there?";
+      setLogs((prev) => [...prev, { role: "ai", text: prompt }]);
+      speakText(prompt);
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [sessionId, isRecording, isProcessing, isTypingReply, sessionEnding]);
 
   return (
     <div className="min-h-screen bg-[#0a0a0f] text-slate-100 overflow-x-hidden selection:bg-indigo-500/30 font-sans flex flex-col">
@@ -573,10 +822,16 @@ export default function InterviewPage() {
 
           <button
             onClick={startSession}
-            disabled={!!sessionId || sessionStarting}
+            disabled={!!sessionId || sessionStarting || (proctorEnabled && cameraStatus !== "enabled")}
             className="px-5 py-2.5 rounded-full border border-white/10 bg-white/5 hover:bg-white/10 transition-colors text-sm font-bold text-slate-200 disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {sessionStarting ? "Starting…" : sessionId ? "Interview Started" : "Start Interview"}
+            {sessionStarting
+              ? "Starting…"
+              : sessionId
+                ? "Interview Started"
+                : proctorEnabled && cameraStatus !== "enabled"
+                  ? "Enable Camera To Start"
+                  : "Start Interview"}
           </button>
           <button
             onClick={endSession}
@@ -595,6 +850,8 @@ export default function InterviewPage() {
           </div>
         </div>
       ) : null}
+
+      {proctorEnabled && sessionId ? <FocusMonitor interviewSessionId={sessionId} /> : null}
 
       <main className="flex-1 relative z-10 max-w-7xl mx-auto w-full px-6 py-12 flex flex-col lg:flex-row gap-8">
         
@@ -627,11 +884,15 @@ export default function InterviewPage() {
               <div className="space-y-5">
                 <div className="flex justify-between items-center text-base">
                   <span className="text-slate-400">Gaze Lock</span>
-                  <span className="text-cyan-400 font-bold">Optimal</span>
+                  <span className="text-cyan-400 font-bold">
+                    {cameraStatus === "enabled" ? "Retina Active" : cameraStatus === "requesting" ? "Scanning..." : "Unavailable"}
+                  </span>
                 </div>
                 <div className="flex justify-between items-center text-base">
-                  <span className="text-slate-400">Audio Clarity</span>
-                  <span className="text-cyan-400 font-bold">128kbps</span>
+                  <span className="text-slate-400">Speech To Text</span>
+                  <span className="text-cyan-400 font-bold">
+                    {sttStatus === "transcribing" ? "Transcribing" : sttStatus === "listening" ? "Listening" : "Idle"}
+                  </span>
                 </div>
                 <div className="flex justify-between items-center text-base">
                   <span className="text-slate-400">Confidence</span>
@@ -671,23 +932,21 @@ export default function InterviewPage() {
 
             <div className="mt-8 pt-8 border-t border-white/10">
               <div className="flex flex-col md:flex-row gap-6 items-center">
-                {sessionId && contextStatus === "ready" ? (
-                  <button 
-                    onClick={isRecording ? stopRecording : startRecording}
-                    disabled={isProcessing}
-                    className={`w-20 h-20 rounded-full flex items-center justify-center transition-all ${
-                      isRecording 
-                        ? 'bg-red-500 hover:bg-red-600 shadow-[0_0_30px_rgba(239,68,68,0.5)] animate-pulse' 
-                        : 'bg-indigo-600 hover:bg-indigo-500 shadow-[0_0_30px_rgba(79,70,229,0.4)]'
-                    } disabled:opacity-50 disabled:cursor-not-allowed`}
-                  >
-                    {isRecording ? <Square className="w-8 h-8 text-white" /> : <Mic className="w-8 h-8 text-white" />}
-                  </button>
-                ) : (
-                  <div className="w-20 h-20 rounded-full flex items-center justify-center border border-white/10 bg-white/5 text-slate-400 text-xs font-bold">
-                    {sessionId ? (contextStatus === "loading" ? "Loading" : "Start") : "Start"}
+                <div className="w-full md:w-auto min-w-[220px] h-20 rounded-2xl border border-white/10 bg-white/5 px-5 flex items-center justify-between">
+                  <div>
+                    <p className="text-xs uppercase tracking-widest text-slate-400 font-bold">Hands-Free</p>
+                    <p className="text-sm text-slate-200 font-semibold">
+                      {sessionId
+                        ? contextStatus === "loading"
+                          ? "Preparing context..."
+                          : isRecording
+                            ? "Turn detection active"
+                            : "Waiting for microphone"
+                        : "Start interview to begin"}
+                    </p>
                   </div>
-                )}
+                  <div className={`w-3 h-3 rounded-full ${isRecording ? "bg-emerald-400 animate-pulse" : "bg-slate-500"}`} />
+                </div>
                 
                 <div className="flex-1 w-full relative">
                   <input
@@ -720,9 +979,99 @@ export default function InterviewPage() {
                   )}
                 </div>
               </div>
+              <div className="mt-4 text-sm text-slate-400">
+                Voice pipeline: continuous microphone capture, 15-second silence turn detection, live speech-to-text, interview response generation, and verbal AI audio reply.
+              </div>
+              <div className="mt-1 text-xs text-slate-500">
+                Context source: {contextSource || "pending"}
+              </div>
             </div>
 
           </div>
+
+          <div className="glass-panel rounded-3xl p-6 md:p-8">
+            <div className="grid grid-cols-1 gap-6">
+              <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-5">
+                <h3 className="text-sm font-bold tracking-widest uppercase text-indigo-300 flex items-center gap-2 mb-4">
+                  <TrendingUp className="w-4 h-4" /> Progress
+                </h3>
+                <div className="space-y-4 text-sm">
+                  <div>
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-slate-400">Interview Completion</span>
+                      <span className="text-indigo-300 font-bold">{performance.progressPercent}%</span>
+                    </div>
+                    <div className="h-2.5 rounded-full bg-white/10 overflow-hidden">
+                      <div
+                        className="h-full bg-gradient-to-r from-indigo-500 to-cyan-400 transition-all duration-500"
+                        style={{ width: `${performance.progressPercent}%` }}
+                      />
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-slate-400">Questions Asked</span>
+                    <span className="text-slate-100 font-semibold">{questionProgress.asked}/{questionProgress.total}</span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-slate-400">Questions Remaining</span>
+                    <span className="text-slate-100 font-semibold">{questionProgress.remaining}</span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-slate-400">Avg. Words / Answer</span>
+                    <span className="text-slate-100 font-semibold">{performance.averageWords}</span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-slate-400">Concise Response Ratio</span>
+                    <span className="text-slate-100 font-semibold">{Math.round(performance.conciseRatio * 100)}%</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {finalSummary ? (
+            <div className="glass-panel rounded-3xl p-6 md:p-8 border border-emerald-500/30 bg-emerald-500/5">
+              <h3 className="text-lg md:text-xl font-bold text-emerald-300 mb-4">
+                Final Interview Feedback
+              </h3>
+              <p className="text-slate-200 whitespace-pre-line leading-relaxed mb-6">{finalSummary.finalFeedback}</p>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-4">
+                  <h4 className="text-xs uppercase tracking-widest text-cyan-300 font-bold mb-3">Strengths</h4>
+                  <ul className="space-y-2 text-sm text-slate-200 list-disc pl-5">
+                    {finalSummary.strengths.length > 0 ? (
+                      finalSummary.strengths.map((item, idx) => <li key={`s-${idx}`}>{item}</li>)
+                    ) : (
+                      <li>Interview participation was consistent.</li>
+                    )}
+                  </ul>
+                </div>
+
+                <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-4">
+                  <h4 className="text-xs uppercase tracking-widest text-amber-300 font-bold mb-3">Where You Lack</h4>
+                  <ul className="space-y-2 text-sm text-slate-200 list-disc pl-5">
+                    {finalSummary.gaps.length > 0 ? (
+                      finalSummary.gaps.map((item, idx) => <li key={`g-${idx}`}>{item}</li>)
+                    ) : (
+                      <li>No critical gaps detected for this round.</li>
+                    )}
+                  </ul>
+                </div>
+
+                <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-4">
+                  <h4 className="text-xs uppercase tracking-widest text-indigo-300 font-bold mb-3">Steps To Improve</h4>
+                  <ul className="space-y-2 text-sm text-slate-200 list-disc pl-5">
+                    {finalSummary.improvementSteps.length > 0 ? (
+                      finalSummary.improvementSteps.map((item, idx) => <li key={`i-${idx}`}>{item}</li>)
+                    ) : (
+                      <li>Repeat one mock round to reinforce retention.</li>
+                    )}
+                  </ul>
+                </div>
+              </div>
+            </div>
+          ) : null}
         </div>
       </main>
     </div>

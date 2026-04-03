@@ -4,11 +4,73 @@ import { PrismaPg } from "@prisma/adapter-pg";
 
 const globalForPrisma = globalThis as unknown as { prisma?: PrismaClient };
 
-function createPrismaClient() {
-  const databaseUrl = process.env.DATABASE_URL;
-  if (!databaseUrl) {
-    throw new Error("DATABASE_URL is not set");
+class DatabaseConnectionConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DatabaseConnectionConfigError";
   }
+}
+
+const PLACEHOLDER_VALUES = new Set(["USER", "PASSWORD", "HOST", "DB_NAME"]);
+const PLACEHOLDER_PREFIX = "YOUR_";
+
+function isPlaceholderValue(value: string | undefined) {
+  if (!value) return false;
+  const normalized = decodeURIComponent(value).trim().toUpperCase();
+  return PLACEHOLDER_VALUES.has(normalized) || normalized.startsWith(PLACEHOLDER_PREFIX);
+}
+
+function getDatabaseUrl() {
+  const databaseUrl = (process.env.DATABASE_URL ?? process.env.DIRECT_URL ?? "").trim();
+  if (!databaseUrl) {
+    throw new DatabaseConnectionConfigError(
+      "Database connection string is missing. Set DATABASE_URL or DIRECT_URL in .env."
+    );
+  }
+
+  let url: URL;
+  try {
+    url = new URL(databaseUrl);
+  } catch {
+    throw new DatabaseConnectionConfigError(
+      "Database connection string is invalid. Check DATABASE_URL or DIRECT_URL in .env."
+    );
+  }
+
+  const dbName = url.pathname?.replace(/^\//, "") ?? "";
+  if (
+    isPlaceholderValue(url.username) ||
+    isPlaceholderValue(url.password) ||
+    isPlaceholderValue(url.hostname) ||
+    isPlaceholderValue(dbName)
+  ) {
+    throw new DatabaseConnectionConfigError(
+      "Database connection string contains placeholders. Update DATABASE_URL or DIRECT_URL in .env with real values."
+    );
+  }
+
+  return databaseUrl;
+}
+
+export function getDatabaseApiError(error: unknown): string | null {
+  if (error instanceof DatabaseConnectionConfigError) {
+    return error.message;
+  }
+
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  if (
+    /(Can't reach database server|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|connect ECONN|Connection terminated unexpectedly)/i.test(
+      message
+    )
+  ) {
+    return "Database is unreachable. Verify DATABASE_URL or DIRECT_URL in .env and ensure Postgres is running and reachable.";
+  }
+
+  return null;
+}
+
+function createPrismaClient() {
+  const databaseUrl = getDatabaseUrl();
 
   const url = new URL(databaseUrl);
   const sslmode = url.searchParams.get("sslmode");
