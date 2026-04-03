@@ -4,7 +4,6 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { motion } from "framer-motion";
 import { Loader2, Bot, ArrowLeft, Activity, User, ShieldAlert, TrendingUp } from "lucide-react";
-import FocusMonitor from "@/components/FocusMonitor";
 import { upsertInterviewTaskHistory } from "@/lib/interviewTaskHistory";
 import { completeInterviewMentorshipTask } from "@/lib/mentorshipPlan";
 
@@ -67,6 +66,10 @@ function speakText(text: string) {
 }
 
 export default function InterviewPage() {
+  const MAX_LOGS = 200;
+  const MAX_AUDIO_CHUNKS = 8;
+  const MAX_NOTES_CHARS = 50_000;
+
   const router = useRouter();
   const searchParams = useSearchParams();
   const topic = searchParams.get("topic")?.trim() || "";
@@ -113,10 +116,54 @@ export default function InterviewPage() {
   const processAudioRef = useRef<(transcript: string) => Promise<void>>(async () => undefined);
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
   const ttsAudioUrlRef = useRef<string | null>(null);
+  const performanceSaveTimerRef = useRef<number | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const [videoId, setVideoId] = useState<string>("");
+
+  useEffect(() => {
+    return () => {
+      try {
+        window.speechSynthesis?.cancel?.();
+      } catch {
+        // ignore
+      }
+
+      try {
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+          suppressStopProcessingRef.current = true;
+          mediaRecorderRef.current.stop();
+        }
+      } catch {
+        // ignore
+      }
+
+      try {
+        streamRef.current?.getTracks().forEach((t) => t.stop());
+      } catch {
+        // ignore
+      }
+      streamRef.current = null;
+
+      try {
+        if (ttsAudioRef.current) {
+          ttsAudioRef.current.pause();
+          ttsAudioRef.current.currentTime = 0;
+        }
+        if (ttsAudioUrlRef.current) {
+          URL.revokeObjectURL(ttsAudioUrlRef.current);
+          ttsAudioUrlRef.current = null;
+        }
+      } catch {
+        // ignore
+      }
+
+      audioChunksRef.current = [];
+      liveTranscriptRef.current = "";
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const transcribeBlob = async (blob: Blob): Promise<string> => {
     if (!blob || blob.size < 2_000) return "";
@@ -247,18 +294,32 @@ export default function InterviewPage() {
   };
 
   useEffect(() => {
-    try {
-      window.localStorage.setItem(
-        "study.interview.performance",
-        JSON.stringify({
-          ...performance,
-          topic,
-          updatedAt: new Date().toISOString(),
-        })
-      );
-    } catch {
-      // ignore storage failures
+    if (typeof window === "undefined") return;
+    if (performanceSaveTimerRef.current) {
+      window.clearTimeout(performanceSaveTimerRef.current);
     }
+
+    performanceSaveTimerRef.current = window.setTimeout(() => {
+      try {
+        window.localStorage.setItem(
+          "study.interview.performance",
+          JSON.stringify({
+            ...performance,
+            topic,
+            updatedAt: new Date().toISOString(),
+          })
+        );
+      } catch {
+        // ignore storage failures
+      }
+    }, 2000);
+
+    return () => {
+      if (performanceSaveTimerRef.current) {
+        window.clearTimeout(performanceSaveTimerRef.current);
+        performanceSaveTimerRef.current = null;
+      }
+    };
   }, [performance, topic]);
 
   useEffect(() => {
@@ -371,7 +432,8 @@ export default function InterviewPage() {
       }
       const text = typeof (data as any).text === "string" ? (data as any).text : "";
       if (!text.trim()) throw new Error("No text extracted from docx");
-      setUploadedNotesText(text);
+      const clipped = text.length > MAX_NOTES_CHARS ? text.slice(0, MAX_NOTES_CHARS) : text;
+      setUploadedNotesText(clipped);
       setContextSource("docx");
     } catch (e) {
       setSessionError(e instanceof Error ? e.message : "Upload failed");
@@ -396,7 +458,10 @@ export default function InterviewPage() {
 
     const responseText = typeof (data as any).response_text === "string" ? (data as any).response_text : "";
     if (responseText.trim()) {
-      setLogs((prev) => [...prev, { role: "ai", text: responseText.trim() }]);
+      setLogs((prev) => {
+        const next = [...prev, { role: "ai", text: responseText.trim() } as const];
+        return next.length > MAX_LOGS ? next.slice(-MAX_LOGS) : next;
+      });
       lastSpeechAtRef.current = Date.now();
     }
   };
@@ -404,7 +469,7 @@ export default function InterviewPage() {
   const startSession = async () => {
     if (sessionStarting || sessionId) return;
     if (proctorEnabled && cameraStatus !== "enabled") {
-      setSessionError("Proctored interview requires active camera/retina scanner before starting.");
+      setSessionError("Proctored interview requires active camera before starting.");
       return;
     }
     setSessionError(null);
@@ -554,6 +619,11 @@ export default function InterviewPage() {
           lastSpeechAtRef.current = Date.now();
           setSttStatus("listening");
           setSessionError(null);
+
+          // Keep only the most recent chunks to avoid unbounded memory growth
+          if (audioChunksRef.current.length > 2) {
+            audioChunksRef.current = audioChunksRef.current.slice(-2);
+          }
         } catch (e) {
           const msg = e instanceof Error ? e.message : "STT failed";
           const unsupported = /corrupt|unsupported data|failed to process audio/i.test(msg);
@@ -575,6 +645,9 @@ export default function InterviewPage() {
 
       mediaRecorder.ondataavailable = (e) => {
         audioChunksRef.current.push(e.data);
+        if (audioChunksRef.current.length > MAX_AUDIO_CHUNKS) {
+          audioChunksRef.current = audioChunksRef.current.slice(-MAX_AUDIO_CHUNKS);
+        }
         void transcribeChunk(e.data);
       };
 
@@ -588,6 +661,7 @@ export default function InterviewPage() {
           // ignore
         }
         streamRef.current = null;
+        audioChunksRef.current = [];
         setSttStatus("idle");
 
         if (suppressStopProcessingRef.current) {
@@ -633,7 +707,8 @@ export default function InterviewPage() {
     const normalized = normalizeTranscript(transcript);
     if (!normalized) return;
     setIsProcessing(true);
-    const newLogs = [...logs, {role: 'user', text: normalized} as const];
+    const baseLogs = logs.length > MAX_LOGS ? logs.slice(-MAX_LOGS) : logs;
+    const newLogs = [...baseLogs, { role: "user", text: normalized } as const];
     setLogs(newLogs);
     setMockTranscript("");
     
@@ -653,14 +728,15 @@ export default function InterviewPage() {
         const isComplete = (data as { is_complete?: boolean }).is_complete === true;
         syncProgressFromData(data);
         const aiIndex = newLogs.length;
-        setLogs([...newLogs, { role: 'ai', text: "" }]);
+        const cappedLogs = newLogs.length > MAX_LOGS ? newLogs.slice(-MAX_LOGS) : newLogs;
+        setLogs([...cappedLogs, { role: "ai", text: "" }]);
         setIsTypingReply(true);
         await typeInto(responseText || "", (typed) => {
           setLogs((prev) => {
             if (aiIndex < 0 || aiIndex >= prev.length) return prev;
             const next = prev.slice();
             next[aiIndex] = { role: "ai", text: typed };
-            return next;
+            return next.length > MAX_LOGS ? next.slice(-MAX_LOGS) : next;
           });
         });
         setIsTypingReply(false);
@@ -725,7 +801,10 @@ export default function InterviewPage() {
         }
     } catch (e) {
       setSessionError(e instanceof Error ? e.message : "Interview cycle failed");
-        setLogs([...newLogs, { role: 'ai', text: "Error connecting to LangGraph Backend." }]);
+        setLogs((prev) => {
+          const next = [...prev, { role: "ai", text: "Error connecting to LangGraph Backend." } as const];
+          return next.length > MAX_LOGS ? next.slice(-MAX_LOGS) : next;
+        });
     }
     setIsProcessing(false);
   };
@@ -851,7 +930,7 @@ export default function InterviewPage() {
         </div>
       ) : null}
 
-      {proctorEnabled && sessionId ? <FocusMonitor interviewSessionId={sessionId} /> : null}
+
 
       <main className="flex-1 relative z-10 max-w-7xl mx-auto w-full px-6 py-12 flex flex-col lg:flex-row gap-8">
         
@@ -882,12 +961,6 @@ export default function InterviewPage() {
                 </h3>
               </div>
               <div className="space-y-5">
-                <div className="flex justify-between items-center text-base">
-                  <span className="text-slate-400">Gaze Lock</span>
-                  <span className="text-cyan-400 font-bold">
-                    {cameraStatus === "enabled" ? "Retina Active" : cameraStatus === "requesting" ? "Scanning..." : "Unavailable"}
-                  </span>
-                </div>
                 <div className="flex justify-between items-center text-base">
                   <span className="text-slate-400">Speech To Text</span>
                   <span className="text-cyan-400 font-bold">

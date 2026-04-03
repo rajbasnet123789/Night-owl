@@ -2,7 +2,7 @@ import os
 import openai
 from langgraph.graph import StateGraph
 from typing import TypedDict, Optional
-from main import tvly, pc, model, index, generator  # Import initialized singletons from main
+from main import tvly, pc, index, generator, _embed_text  # Import initialized singletons from main
 
 # Define state strictly as dict but with hints
 class InterviewState(TypedDict):
@@ -40,7 +40,7 @@ def rag_node(state: dict) -> dict:
     print("Executing RAG...")
     transcript = state.get("transcript", "")
     try:
-        vector = model.encode(transcript).tolist()
+        vector = _embed_text(str(transcript))
         results = index.query(vector=vector, top_k=2, include_metadata=True)
         context = " ".join([m["metadata"]["text"] for m in results["matches"]])
     except Exception:

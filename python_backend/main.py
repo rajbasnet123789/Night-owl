@@ -1,20 +1,22 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import os
+import hashlib
 from dotenv import load_dotenv
-import lmppl
-from transformers import pipeline
-from pinecone import Pinecone, ServerlessSpec
-from sentence_transformers import SentenceTransformer
-from tavily import TavilyClient
+import gc
+import psutil
 from typing import List, Optional, TypedDict
 from langgraph.graph import StateGraph
 import math
 from huggingface_hub import InferenceClient
+from pinecone import Pinecone, ServerlessSpec
+from tavily import TavilyClient
+from memory_monitor import create_memory_monitor_middleware, log_memory_if_needed
 
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
+app = create_memory_monitor_middleware(app)
 
 # Load env vars from workspace .env when running locally
 try:
@@ -40,12 +42,9 @@ if not TAVILY_API_KEY:
 
 print("Initializing Models and Services...")
 tvly = TavilyClient(api_key=TAVILY_API_KEY)
-try:
-    scorer = lmppl.LM("gpt2")
-except Exception as e:
-    # Keep server booting even if optional perplexity model cannot initialize.
-    print(f"Warning: perplexity scorer unavailable ({e})")
-    scorer = None
+# SKIP lmppl GTP2 model - too heavy, causes memory bloat (~2GB+)
+scorer = None
+print("Perplexity scorer disabled to conserve memory")
 
 # Text generation: prefer Hugging Face hosted inference (better quality, no local model load)
 HF_KEY = (os.getenv("HF_KEY") or "").strip()
@@ -58,13 +57,23 @@ if HF_KEY:
     except Exception:
         hf_client = None
 
-_local_generator = None
+EMBED_DIM = 384
 
+# DISABLED: Local text generation disabled - use HuggingFace API instead
 def _ensure_local_generator():
-    global _local_generator
-    if _local_generator is None:
-        _local_generator = pipeline("text-generation", model="gpt2")
-    return _local_generator
+    # Prevents heavy model loading that causes memory bloat
+    return None
+
+def _garbage_collect_if_needed(threshold_mb: int = 1000):
+    """Force garbage collection if memory pressure is high."""
+    try:
+        process = psutil.Process(os.getpid())
+        mem_mb = process.memory_info().rss / 1024 / 1024
+        if mem_mb > threshold_mb:
+            gc.collect()
+            print(f"[GC] Freed memory. Current: {mem_mb:.0f}MB")
+    except Exception:
+        gc.collect()
 
 def _clamp_tokens(max_new_tokens: int) -> int:
     try:
@@ -72,6 +81,24 @@ def _clamp_tokens(max_new_tokens: int) -> int:
     except Exception:
         n = 128
     return max(16, min(512, n))
+
+
+def _embed_text(text: str, dim: int = EMBED_DIM) -> List[float]:
+    s = (text or "").strip().lower()
+    if not s:
+        return [0.0] * dim
+
+    vec = [0.0] * dim
+    for token in s.split():
+        digest = hashlib.sha256(token.encode("utf-8", errors="ignore")).digest()
+        idx = int.from_bytes(digest[:4], "big") % dim
+        sign = 1.0 if (digest[4] % 2 == 0) else -1.0
+        vec[idx] += sign
+
+    norm = math.sqrt(sum(v * v for v in vec))
+    if norm <= 1e-12:
+        return vec
+    return [v / norm for v in vec]
 
 
 def generate_text_completion(prompt: str, max_new_tokens: int) -> str:
@@ -111,13 +138,8 @@ def generate_text_completion(prompt: str, max_new_tokens: int) -> str:
             # fall through to local
             pass
 
-    # Local fallback
-    try:
-        gen = _ensure_local_generator()
-        output = gen(prompt, max_new_tokens=max_new_tokens, return_full_text=False, num_return_sequences=1)
-        return (output[0].get("generated_text") or "").strip()
-    except Exception:
-        return ""
+    # Local fallback disabled - too memory intensive
+    return "Unable to generate (local generator disabled to save memory)."
 
 
 def generate_chat(system_prompt: str, user_prompt: str, max_new_tokens: int) -> str:
@@ -152,10 +174,11 @@ def generate_chat(system_prompt: str, user_prompt: str, max_new_tokens: int) -> 
 pc = Pinecone(api_key=PINECONE_API_KEY)
 index_name = "interview-ai"
 if index_name not in pc.list_indexes().names():
-    pc.create_index(name=index_name, dimension=384, metric="cosine", spec=ServerlessSpec(cloud="aws", region="us-east-1"))
+    pc.create_index(name=index_name, dimension=EMBED_DIM, metric="cosine", spec=ServerlessSpec(cloud="aws", region="us-east-1"))
 index = pc.Index(index_name)
-model = SentenceTransformer("all-MiniLM-L6-v2")
 print("Initialization Complete.")
+gc.collect()
+print("[STARTUP] Initial garbage collection pass completed")
 
 # ================================
 # LANGGRAPH ORCHESTRATION PIPELINE
@@ -167,18 +190,22 @@ def stt_node(state: dict) -> dict:
 
 def search_node(state: dict) -> dict:
     print("[LangGraph] Executing Search...")
+    state.pop("search_results", None)
     if state.get("mode") == "fast":
         return {"search_results": ""}
     try:
         res = tvly.search(query=state.get("transcript", "") + " interview best practices")
-        return {"search_results": str(res.get("results", []))[:1000]}
-    except:
+        search_text = str(res.get("results", []))[:800]
+        return {"search_results": search_text}
+    except Exception as e:
+        print(f"Search error: {e}")
         return {"search_results": ""}
 
 def rag_node(state: dict) -> dict:
     print("[LangGraph] Executing RAG...")
+    state.pop("rag_context", None)
     try:
-        vector = model.encode(state.get("transcript", "")).tolist()
+        vector = _embed_text(str(state.get("transcript", ""))[:800])
 
         session_id = str(state.get("session_id") or "").strip()
         if session_id:
@@ -193,9 +220,11 @@ def rag_node(state: dict) -> dict:
                 pass
 
         results = index.query(vector=vector, top_k=2, include_metadata=True)
-        return {"rag_context": " ".join([m["metadata"]["text"] for m in results["matches"]])}
-    except:
-        return {"rag_context": "No context found."}
+        rag_text = " ".join([m["metadata"]["text"] for m in results["matches"]])[:1000]
+        return {"rag_context": rag_text}
+    except Exception as e:
+        print(f"RAG error: {e}")
+        return {"rag_context": ""}
 
 def llm_node(state: dict) -> dict:
     print("[LangGraph] Executing LLM...")
@@ -267,14 +296,19 @@ class InterviewPayload(BaseModel):
 def execute_interview_cycle(payload: InterviewPayload):
     try:
         initial_state = {
-            "transcript": payload.transcript,
+            "transcript": payload.transcript[:1000],
             "mode": payload.mode,
             "topic": payload.topic,
             "session_id": payload.session_id,
         }
         final_state = interview_graph.invoke(initial_state)
-        return {"response_text": final_state.get("final_response"), "audio_url": final_state.get("tts_audio_path")}
+        result = {"response_text": final_state.get("final_response", ""), "audio_url": final_state.get("tts_audio_path", "")}
+        initial_state.clear()
+        final_state.clear()
+        _garbage_collect_if_needed(800)
+        return result
     except Exception as e:
+        _garbage_collect_if_needed()
         raise HTTPException(status_code=500, detail=str(e))
 
 class TextPayload(BaseModel): text: List[str]
@@ -322,9 +356,9 @@ def generate_text(payload: GeneratePayload):
         print("GENERATE ERROR:", e)
         raise HTTPException(status_code=500, detail=str(e))
 @app.post("/api/store")
-def store_data(payload: StorePayload): index.upsert([(payload.id, model.encode(payload.text).tolist(), {"text": payload.text})]); return {"status": "stored"}
+def store_data(payload: StorePayload): index.upsert([(payload.id, _embed_text(payload.text), {"text": payload.text})]); return {"status": "stored"}
 @app.post("/api/retrieve")
-def retrieve_data(payload: RetrievePayload): return {"context": " ".join([m["metadata"]["text"] for m in index.query(vector=model.encode(payload.query).tolist(), top_k=3, include_metadata=True)["matches"]])}
+def retrieve_data(payload: RetrievePayload): return {"context": " ".join([m["metadata"]["text"] for m in index.query(vector=_embed_text(payload.query), top_k=3, include_metadata=True)["matches"]])}
 @app.post("/api/search")
 def search_data(payload: SearchPayload): return {"results": tvly.search(payload.query)}
 
@@ -368,7 +402,7 @@ def ingest_context(payload: IngestContextPayload):
 
     vectors = []
     for idx, chunk in enumerate(chunks[:80]):
-        emb = model.encode(chunk).tolist()
+        emb = _embed_text(chunk)
         vectors.append((f"{session_id}-{idx}", emb, {"text": chunk, "source": source}))
 
     # Store in a session namespace so interview RAG uses *what the user studied*.
@@ -416,7 +450,7 @@ def video_pick(payload: VideoPickPayload):
     max_youtube = max(3, min(20, max_youtube))
 
     stage_text = f"{topic} — {stage_title}"
-    stage_vec = model.encode(stage_text).tolist()
+    stage_vec = _embed_text(stage_text)
 
     # 1) Find strong, stage-specific resources (reddit/blog/leetcode style pages)
     seed_query = f"best {stage_title} {topic} resources reddit blog interview"
@@ -435,7 +469,7 @@ def video_pick(payload: VideoPickPayload):
             continue
         text = (title + "\n" + content)[:2000]
         try:
-            vec = model.encode(text).tolist()
+            vec = _embed_text(text)
             score = _cosine(stage_vec, vec)
         except Exception:
             score = 0.0
@@ -468,7 +502,7 @@ def video_pick(payload: VideoPickPayload):
             continue
         text = (title + "\n" + content)[:2000]
         try:
-            vec = model.encode(text).tolist()
+            vec = _embed_text(text)
             score = _cosine(stage_vec, vec)
         except Exception:
             score = 0.0

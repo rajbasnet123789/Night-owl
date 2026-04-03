@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "reac
 import { useParams, useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
 import { PlayCircle, BrainCircuit, ArrowLeft, Send, Sparkles, CheckCircle2, AlertTriangle, ShieldAlert, BookOpen } from "lucide-react";
-import FocusMonitor from "@/components/FocusMonitor";
+
 import { completeStageMentorshipTasks, getAssessmentInterval, getStageBand, normalizeLevel, type SkillLevel } from "@/lib/mentorshipPlan";
 
 type VideoHit = {
@@ -420,7 +420,7 @@ export default function StageView() {
               onClick={() => {
                 const id = extractYouTubeIdFromEmbedUrl(videos[selectedVideoIndex]?.embedUrl);
                 const suffix = id ? `&videoId=${encodeURIComponent(id)}` : "";
-                router.push(`/interview?topic=${encodeURIComponent(effectiveTopic)}&proctor=1${suffix}`);
+                router.push(`/interview?topic=${encodeURIComponent(effectiveTopic)}${suffix}`);
               }}
               className="w-full sm:w-auto bg-gradient-to-r from-indigo-600 to-fuchsia-600 text-white font-bold px-8 py-4 rounded-2xl shadow-[0_0_20px_rgba(99,102,241,0.25)] transition hover:scale-[1.02] active:scale-[0.99]"
             >
@@ -573,7 +573,7 @@ export default function StageView() {
             </div>
           ) : (
             <div className="max-w-4xl mx-auto space-y-8">
-              {oaSessionId ? <FocusMonitor oaSessionId={oaSessionId} /> : null}
+
               <div className="glass-panel rounded-3xl p-8 md:p-12 shadow-2xl relative overflow-hidden">
                 <div className="absolute top-0 right-0 p-8 opacity-5 pointer-events-none">
                   <BrainCircuit className="w-64 h-64" />
