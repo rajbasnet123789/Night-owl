@@ -40,7 +40,12 @@ if not TAVILY_API_KEY:
 
 print("Initializing Models and Services...")
 tvly = TavilyClient(api_key=TAVILY_API_KEY)
-scorer = lmppl.LM("gpt2")
+try:
+    scorer = lmppl.LM("gpt2")
+except Exception as e:
+    # Keep server booting even if optional perplexity model cannot initialize.
+    print(f"Warning: perplexity scorer unavailable ({e})")
+    scorer = None
 
 # Text generation: prefer Hugging Face hosted inference (better quality, no local model load)
 HF_KEY = (os.getenv("HF_KEY") or "").strip()
@@ -290,7 +295,19 @@ class VideoPickPayload(BaseModel):
     max_youtube: Optional[int] = 10
 
 @app.post("/api/perplexity")
-def get_perplexity(payload: TextPayload): return {"scores": list(zip(payload.text, scorer.get_perplexity(payload.text)))}
+def get_perplexity(payload: TextPayload):
+    # Fallback keeps downstream flow alive when local perplexity model is unavailable.
+    if scorer is None:
+        fallback_scores = [100.0 + (min(len(t), 400) / 10.0) for t in payload.text]
+        return {
+            "scores": list(zip(payload.text, fallback_scores)),
+            "warning": "Perplexity model unavailable; using fallback scores.",
+        }
+
+    try:
+        return {"scores": list(zip(payload.text, scorer.get_perplexity(payload.text)))}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Perplexity scoring failed: {e}")
 @app.post("/api/generate")
 def generate_text(payload: GeneratePayload): 
     try:

@@ -3,8 +3,9 @@
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
-import { PlayCircle, BrainCircuit, ArrowLeft, Send, Sparkles, CheckCircle2, AlertTriangle, ShieldAlert, BookOpen, Activity } from "lucide-react";
+import { PlayCircle, BrainCircuit, ArrowLeft, Send, Sparkles, CheckCircle2, AlertTriangle, ShieldAlert, BookOpen } from "lucide-react";
 import FocusMonitor from "@/components/FocusMonitor";
+import { completeStageMentorshipTasks, getAssessmentInterval, getStageBand, normalizeLevel, type SkillLevel } from "@/lib/mentorshipPlan";
 
 type VideoHit = {
   title: string;
@@ -19,6 +20,13 @@ type EvaluationFeedback = {
   perplexityScore?: number;
   isCheating?: boolean;
   error?: string;
+};
+
+type QuizPayload = {
+  quiz?: string;
+  followUps?: string[];
+  optimizationHint?: string;
+  mode?: string;
 };
 
 function extractYouTubeIdFromEmbedUrl(embedUrl: string | null | undefined): string {
@@ -56,8 +64,10 @@ export default function StageView() {
   
   const stageId = typeof params.id === "string" ? params.id : "";
   const storedTopic = useLocalStorageItem("study.topic") ?? "";
+  const storedLevel = useLocalStorageItem("study.level") ?? "Medium";
   const storedRoadmapJson = useLocalStorageItem("study.roadmap");
   const storedPlanJson = useLocalStorageItem("study.plan");
+  const selectedLevel = useMemo<SkillLevel>(() => normalizeLevel(storedLevel), [storedLevel]);
 
   const roadmapStages = useMemo(() => {
     if (!storedRoadmapJson) return [] as Array<{ id: string; title: string }>;
@@ -95,6 +105,15 @@ export default function StageView() {
   }, [planStageIds, stageId]);
 
   const roundTotal = planStageIds.length > 0 ? planStageIds.length : null;
+  const stageNumber = useMemo(() => {
+    const fromId = Number(stageId.split("-")[1]);
+    if (Number.isFinite(fromId) && fromId > 0) return fromId;
+    return typeof roundIndex === "number" ? roundIndex + 1 : 1;
+  }, [stageId, roundIndex]);
+  const stageBand = getStageBand(stageNumber);
+  const sessionNumber = typeof roundIndex === "number" ? roundIndex + 1 : 1;
+  const assessmentEvery = getAssessmentInterval(selectedLevel);
+  const isPeriodicAssessment = sessionNumber % assessmentEvery === 0;
 
   const effectiveTopic = useMemo(() => {
     const t = storedTopic.trim();
@@ -109,6 +128,13 @@ export default function StageView() {
   const [loadingQuiz, setLoadingQuiz] = useState(false);
   const [evaluating, setEvaluating] = useState(false);
   const [feedback, setFeedback] = useState<EvaluationFeedback | null>(null);
+  const [followUps, setFollowUps] = useState<string[]>([]);
+  const [optimizationHint, setOptimizationHint] = useState("");
+  const [practiceModeLabel, setPracticeModeLabel] = useState("Practice session");
+  const [attemptCount, setAttemptCount] = useState(0);
+  const [assistantPrompt, setAssistantPrompt] = useState("");
+  const [assistantReply, setAssistantReply] = useState("");
+  const [assistantLoading, setAssistantLoading] = useState(false);
   const [oaSessionId, setOaSessionId] = useState<string | null>(null);
 
   const [videos, setVideos] = useState<VideoHit[]>([]);
@@ -142,10 +168,18 @@ export default function StageView() {
       const res = await fetch("/api/quiz", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ topic: effectiveTopic })
+        body: JSON.stringify({
+          topic: effectiveTopic,
+          level: selectedLevel,
+          sessionNumber,
+          mode: isPeriodicAssessment ? "assessment" : "practice",
+        })
       });
-      const data = await res.json();
+      const data = (await res.json()) as QuizPayload;
       setQuizQuestion(data.quiz || "What are the core principles of this topic?");
+      setFollowUps(Array.isArray(data.followUps) ? data.followUps.filter((x) => typeof x === "string") : []);
+      setOptimizationHint(typeof data.optimizationHint === "string" ? data.optimizationHint : "");
+      setPracticeModeLabel(typeof data.mode === "string" ? data.mode : (isPeriodicAssessment ? "Retention checkpoint" : "Practice session"));
 
       // Start OA session once we have a question
       const question = data.quiz || "What are the core principles of this topic?";
@@ -175,10 +209,57 @@ export default function StageView() {
       });
       const data = await res.json();
       setFeedback(data);
+      setAttemptCount((prev) => prev + 1);
+
+      const score = typeof data.evaluationScore === "number" ? Math.max(0, Math.min(100, data.evaluationScore)) : null;
+      const rating = score === null ? undefined : Math.round((score / 20) * 10) / 10;
+      completeStageMentorshipTasks(stageId, {
+        includePractice: true,
+        includeAssessment: isPeriodicAssessment,
+        feedback: typeof data.evaluation === "string" ? data.evaluation : undefined,
+        rating,
+      });
+
+      if (typeof score === "number" && score < 60) {
+        setAssistantReply("You are close. Focus on concept -> example -> trade-off. Start by defining the concept in one sentence, then apply it to this stage, and finally mention one optimization with a risk.");
+      }
     } catch (err) {
       console.error(err);
     }
     setEvaluating(false);
+  };
+
+  const requestAssistantGuidance = async () => {
+    const question = assistantPrompt.trim();
+    if (!question) return;
+    setAssistantLoading(true);
+    try {
+      const prompt = [
+        `You are a mentorship assistant for stage learning.`,
+        `Topic: ${effectiveTopic}`,
+        `Stage: ${stageTitle}`,
+        `Level: ${selectedLevel}`,
+        `Session: ${sessionNumber}`,
+        `User question: ${question}`,
+        "Respond with concise guidance in exactly 3 bullet points and one tiny practice task.",
+      ].join("\n");
+
+      const res = await fetch("/api/stage/assist", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt }),
+      });
+      const data = await res.json().catch(() => ({}));
+      const text = typeof (data as { generated_text?: unknown }).generated_text === "string"
+        ? (data as { generated_text: string }).generated_text.trim()
+        : "";
+
+      setAssistantReply(text || "1. Break the concept into smaller steps.\n2. Solve one example manually.\n3. Explain your solution out loud.\nTiny task: write a 5-line summary and one optimization idea.");
+    } catch {
+      setAssistantReply("1. Focus on one concept at a time.\n2. Practice with one structured example.\n3. Compare a basic and optimized solution.\nTiny task: write one short answer with concept, example, and trade-off.");
+    } finally {
+      setAssistantLoading(false);
+    }
   };
 
   const navigateAfterRound = async (target: string) => {
@@ -267,7 +348,23 @@ export default function StageView() {
     return () => {
       cancelled = true;
     };
-  }, [activeTab, effectiveTopic]);
+  }, [activeTab, effectiveTopic, stageTitle, storedTopic]);
+
+  const assistanceChecklist = useMemo(() => {
+    const levelTip =
+      selectedLevel === "Easy"
+        ? "Break this stage into two short sessions and focus on one concept at a time."
+        : selectedLevel === "Hard"
+          ? "Push for one optimized implementation and one trade-off analysis."
+          : "Balance concept understanding with one practical implementation.";
+
+    return [
+      `Band target: ${stageBand} progression for ${effectiveTopic}.`,
+      `Session ${sessionNumber}: ${isPeriodicAssessment ? "retention assessment" : "practice"} mode active.`,
+      levelTip,
+      "Use the format: concept -> example -> optimization trade-off.",
+    ];
+  }, [selectedLevel, stageBand, effectiveTopic, sessionNumber, isPeriodicAssessment]);
 
   return (
     <div className="min-h-screen bg-[#0a0a0f] text-slate-100 overflow-x-hidden selection:bg-cyan-500/30">
@@ -292,6 +389,9 @@ export default function StageView() {
                 {typeof roundIndex === "number" && typeof roundTotal === "number"
                   ? `OA Round ${roundIndex + 1}/${roundTotal}`
                   : `Stage ${stageId.split("-")[1] || "1"}`}
+              </span>
+              <span className="bg-indigo-500/10 text-indigo-300 border border-indigo-500/20 px-4 py-1.5 rounded-full text-sm font-black uppercase tracking-widest">
+                {selectedLevel} • {stageBand}
               </span>
             </div>
             <h1 className="text-5xl md:text-6xl font-extrabold bg-gradient-to-br from-white to-slate-400 bg-clip-text text-transparent">
@@ -429,16 +529,42 @@ export default function StageView() {
                   <h3 className="flex items-center gap-3 text-xl font-bold mb-6 text-indigo-300">
                     <Sparkles className="w-6 h-6" /> Stage Assistant
                   </h3>
-                  <div className="flex-1 flex flex-col justify-center items-center text-center opacity-60">
-                    <Sparkles className="w-16 h-16 mb-4 text-indigo-500/50" />
-                    <p className="text-base">I&apos;m here to help clarify any concepts from this stage. Ask me anything.</p>
+                  <div className="flex-1 space-y-4">
+                    <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
+                      <p className="text-xs font-bold uppercase tracking-widest text-slate-400 mb-3">Guidance Checklist</p>
+                      <ul className="space-y-2 text-sm text-slate-300 list-disc pl-5">
+                        {assistanceChecklist.map((item, idx) => (
+                          <li key={`assist-${idx}`}>{item}</li>
+                        ))}
+                      </ul>
+                    </div>
+
+                    {assistantReply ? (
+                      <div className="rounded-2xl border border-indigo-500/30 bg-indigo-500/10 p-4">
+                        <p className="text-sm whitespace-pre-line text-indigo-100">{assistantReply}</p>
+                      </div>
+                    ) : (
+                      <div className="flex flex-col justify-center items-center text-center opacity-60 py-4">
+                        <Sparkles className="w-12 h-12 mb-3 text-indigo-500/50" />
+                        <p className="text-sm">Ask for hints if you are stuck on this stage.</p>
+                      </div>
+                    )}
                   </div>
                   <div className="mt-6 relative">
                     <input 
+                      value={assistantPrompt}
+                      onChange={(e) => setAssistantPrompt(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") void requestAssistantGuidance();
+                      }}
                       placeholder="Type a question..." 
                       className="w-full bg-black/40 border border-white/10 rounded-2xl pl-6 pr-16 py-5 text-base focus:outline-none focus:ring-1 focus:ring-indigo-500 text-white"
                     />
-                    <button className="absolute right-3 top-1/2 -translate-y-1/2 p-3 bg-indigo-500/20 hover:bg-indigo-500/40 text-indigo-300 rounded-xl transition-colors">
+                    <button
+                      onClick={() => void requestAssistantGuidance()}
+                      disabled={assistantLoading || !assistantPrompt.trim()}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 p-3 bg-indigo-500/20 hover:bg-indigo-500/40 text-indigo-300 rounded-xl transition-colors disabled:opacity-50"
+                    >
                       <Send className="w-5 h-5" />
                     </button>
                   </div>
@@ -454,7 +580,7 @@ export default function StageView() {
                 </div>
                 
                 <h2 className="text-3xl font-bold mb-10 flex items-center justify-between relative z-10">
-                  <span>Knowledge Assessment</span>
+                  <span>{isPeriodicAssessment ? "Knowledge Assessment" : "Practice Session"}</span>
                   {feedback && (
                      <span className={`text-base px-5 py-2.5 rounded-full border font-black ${
                        feedback.isCheating ? "bg-red-500/10 text-red-400 border-red-500/20" : "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
@@ -465,16 +591,40 @@ export default function StageView() {
                 </h2>
 
                 <div className="space-y-8 relative z-10">
+                  <div className="rounded-2xl border border-cyan-500/20 bg-cyan-500/10 px-4 py-3 text-xs uppercase tracking-widest font-bold text-cyan-300">
+                    {practiceModeLabel} • Level {selectedLevel} • Session {sessionNumber}
+                  </div>
+                  <div className="text-xs text-slate-500">Attempts in this stage: {attemptCount}</div>
+
                   {loadingQuiz ? (
                     <div className="animate-pulse space-y-4">
                        <div className="h-8 bg-white/10 rounded w-3/4"></div>
                        <div className="h-8 bg-white/10 rounded w-1/2"></div>
                     </div>
                   ) : (
-                    <div className="text-xl md:text-2xl text-slate-200 leading-relaxed bg-black/40 p-8 border border-white/5 rounded-2xl">
-                      {quizQuestion}
+                    <div className="space-y-4">
+                      <div className="text-xl md:text-2xl text-slate-200 leading-relaxed bg-black/40 p-8 border border-white/5 rounded-2xl">
+                        {quizQuestion}
+                      </div>
+                      {followUps.length > 0 ? (
+                        <div className="rounded-2xl border border-white/10 bg-black/20 p-5">
+                          <p className="text-xs uppercase tracking-widest text-slate-400 font-bold mb-3">Follow-up Questions</p>
+                          <ul className="space-y-2 text-sm text-slate-300 list-disc pl-5">
+                            {followUps.map((item, idx) => <li key={`fu-${idx}`}>{item}</li>)}
+                          </ul>
+                        </div>
+                      ) : null}
+                      {optimizationHint ? (
+                        <div className="rounded-2xl border border-indigo-500/30 bg-indigo-500/10 px-4 py-3 text-sm text-indigo-100">
+                          <span className="font-bold">Optimization Hint:</span> {optimizationHint}
+                        </div>
+                      ) : null}
                     </div>
                   )}
+
+                  <div className="rounded-2xl border border-white/10 bg-black/20 px-4 py-3 text-sm text-slate-300">
+                    Microphone not working? Continue with text-based practice here. Your answer will still be assessed and tracked.
+                  </div>
 
                   <textarea
                     value={answer}

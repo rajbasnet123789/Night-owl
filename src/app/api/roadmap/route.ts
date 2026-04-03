@@ -5,26 +5,154 @@ type RoadmapStage = {
   title: string;
   objectives: string;
   difficulty: 'Beginner' | 'Intermediate' | 'Advanced';
+  band: 'Stage 1-10' | 'Stage 11-20' | 'Stage 21-30';
+  level: 'Easy' | 'Medium' | 'Hard';
 };
+
+type TaskPriority = 'Low' | 'Medium' | 'High';
+type StageBand = 'Stage 1-10' | 'Stage 11-20' | 'Stage 21-30';
+
+function parseLevel(input: unknown): 'Easy' | 'Medium' | 'Hard' {
+  const txt = typeof input === 'string' ? input.trim().toLowerCase() : '';
+  if (txt === 'easy') return 'Easy';
+  if (txt === 'hard') return 'Hard';
+  return 'Medium';
+}
+
+function parsePriority(input: unknown): TaskPriority {
+  const txt = typeof input === 'string' ? input.trim().toLowerCase() : '';
+  if (txt === 'low') return 'Low';
+  if (txt === 'high') return 'High';
+  return 'Medium';
+}
+
+function stageBandsForLevel(level: 'Easy' | 'Medium' | 'Hard'): StageBand[] {
+  if (level === 'Easy') return ['Stage 1-10'];
+  if (level === 'Medium') return ['Stage 1-10', 'Stage 11-20'];
+  return ['Stage 1-10', 'Stage 11-20', 'Stage 21-30'];
+}
+
+function stageNumbersFromBands(bands: StageBand[]) {
+  const out: number[] = [];
+  for (const band of bands) {
+    if (band === 'Stage 1-10') {
+      for (let n = 1; n <= 10; n += 1) out.push(n);
+      continue;
+    }
+    if (band === 'Stage 11-20') {
+      for (let n = 11; n <= 20; n += 1) out.push(n);
+      continue;
+    }
+    for (let n = 21; n <= 30; n += 1) out.push(n);
+  }
+  return out;
+}
+
+function stageBand(index: number): 'Stage 1-10' | 'Stage 11-20' | 'Stage 21-30' {
+  if (index < 10) return 'Stage 1-10';
+  if (index < 20) return 'Stage 11-20';
+  return 'Stage 21-30';
+}
+
+function stageDifficulty(index: number): 'Beginner' | 'Intermediate' | 'Advanced' {
+  if (index < 10) return 'Beginner';
+  if (index < 20) return 'Intermediate';
+  return 'Advanced';
+}
+
+function levelTitleBank(level: 'Easy' | 'Medium' | 'Hard') {
+  if (level === 'Easy') {
+    return {
+      foundational: ['Concept Basics', 'Core Terms', 'Simple Workflow', 'Starter Patterns', 'Guided Example', 'Basic Components', 'Beginner Exercises', 'Foundational Review', 'Mini Use Case', 'Checkpoint 1'],
+      applied: ['Applied Patterns', 'Hands-on Task', 'Scenario Practice', 'Debug Basics', 'Data Flow', 'Integration Intro', 'Boundary Cases', 'Mini Build', 'Review and Refine', 'Checkpoint 2'],
+      advanced: ['Optimization Intro', 'Scaling Basics', 'Reliability Basics', 'Trade-off Thinking', 'Architecture View', 'Performance Checks', 'Secure Defaults', 'Refactor Pass', 'Capstone Draft', 'Final Review'],
+    };
+  }
+  if (level === 'Hard') {
+    return {
+      foundational: ['Deep Fundamentals', 'Low-level Mechanics', 'Advanced Primitives', 'Edge-first Thinking', 'Constraint Modeling', 'Complexity Profiling', 'Failure Modes', 'Protocol Mapping', 'Design Heuristics', 'Checkpoint 1'],
+      applied: ['System Integration', 'Performance Tuning', 'Reliability Engineering', 'Concurrency Patterns', 'State Consistency', 'Load Handling', 'Observability Design', 'Recovery Flows', 'Benchmark Lab', 'Checkpoint 2'],
+      advanced: ['Scalability Strategies', 'Security Hardening', 'Optimization Trade-offs', 'Architecture Critique', 'Production Readiness', 'Cost-performance Balance', 'Stress Testing', 'Interview-grade Scenarios', 'Capstone Build', 'Final Review'],
+    };
+  }
+
+  return {
+    foundational: ['Core Foundations', 'Key Concepts', 'System Basics', 'Practical Intro', 'Pattern Basics', 'Guided Build', 'Problem Framing', 'Validation Basics', 'Mini Challenge', 'Checkpoint 1'],
+    applied: ['Applied Systems', 'Hands-on Implementation', 'Scenario Solving', 'Debug and Improve', 'Data and Flow', 'Integration Practice', 'Edge Handling', 'Quality Checks', 'Refinement Cycle', 'Checkpoint 2'],
+    advanced: ['Optimization Pass', 'Scalable Design', 'Reliability Patterns', 'Security and Safety', 'Architecture Decisions', 'Performance Analysis', 'Trade-off Review', 'Production Scenarios', 'Capstone Run', 'Final Review'],
+  };
+}
+
+function buildFallback(
+  topic: string,
+  level: 'Easy' | 'Medium' | 'Hard',
+  task: string,
+  priority: TaskPriority,
+  stageNumbers: number[]
+) {
+  const bank = levelTitleBank(level);
+  const cadenceHint = priority === 'High'
+    ? 'Keep tasks concise and outcome-focused for faster delivery.'
+    : priority === 'Low'
+      ? 'Focus on depth, concept clarity, and reflection before moving on.'
+      : 'Balance speed and depth with one concept and one implementation step.';
+  const taskHint = task.trim() ? `Today task context: ${task.trim()}.` : '';
+
+  const stages: RoadmapStage[] = [];
+  const topicShort = topic.trim().slice(0, 24) || 'Topic';
+  for (const n of stageNumbers) {
+    const i = n - 1;
+    const pool = i < 10 ? bank.foundational : i < 20 ? bank.applied : bank.advanced;
+    const title = `${topicShort} ${pool[i % 10]} ${n}`;
+    const objective =
+      level === 'Easy'
+        ? `Study one clear concept in ${topic}, solve one guided exercise, and write one short reflection. ${taskHint} ${cadenceHint}`
+        : level === 'Hard'
+          ? `Study advanced ${topic} patterns and complete one optimization-focused implementation with trade-off notes. ${taskHint} ${cadenceHint}`
+          : `Study key ${topic} concepts and complete one practical implementation task with quick evaluation. ${taskHint} ${cadenceHint}`;
+
+    stages.push({
+      id: `stage-${i + 1}`,
+      title,
+      objectives: objective,
+      difficulty: stageDifficulty(i),
+      band: stageBand(i),
+      level,
+    });
+  }
+  return stages;
+}
 
 export async function POST(req: Request) {
   try {
     const body: unknown = await req.json();
     const topic = typeof (body as { topic?: unknown })?.topic === 'string' ? (body as { topic: string }).topic : '';
+    const todayTask = typeof (body as { task?: unknown })?.task === 'string' ? (body as { task: string }).task.trim() : '';
+    const priority = parsePriority((body as { priority?: unknown })?.priority);
+    const level = parseLevel((body as { level?: unknown })?.level);
+    const stageBands = stageBandsForLevel(level);
+    const stageNumbers = stageNumbersFromBands(stageBands);
+    const targetCount = stageNumbers.length;
     if (!topic.trim()) {
       return NextResponse.json({ error: 'Missing topic' }, { status: 400 });
     }
-
-    // Prompt template: force 10 point-wise items for the exact topic
+    // Prompt template: force a level-appropriate roadmap with progression bands and level adaptation.
     const prompt = [
       "You are an expert curriculum coach.",
-      "Generate a study roadmap for TODAY.",
+      "Generate a structured mentorship roadmap.",
       "Topic: " + topic.trim(),
+      "Selected level: " + level,
+      "Today's task: " + (todayTask || 'General mastery'),
+      "Task priority: " + priority,
+      "Selected stage bands: " + stageBands.join(', '),
       "Constraints:",
-      "- Output EXACTLY 10 items.",
+      `- Output EXACTLY ${targetCount} items.`,
       "- Each item must be ONE line.",
       "- Format: N. <Short stage title>: <what to study + tiny practice task>",
       "- Keep titles short (3-7 words).",
+      "- Stages 1-10 should be foundational, 11-20 applied, 21-30 advanced.",
+      "- Difficulty and pace must match selected level.",
+      "- Each stage must be unique and non-repeating.",
       "- Do NOT mention any other language/topic.",
       "Output:",
     ]
@@ -41,30 +169,54 @@ export async function POST(req: Request) {
         throw new Error("Python backend generation failed");
     }
 
-    const generateData = await generateRes.json().catch(() => ({} as any));
-    const roadmapText = typeof (generateData as any)?.generated_text === "string" ? (generateData as any).generated_text : "";
+    const generateData: { generated_text?: unknown } = await generateRes
+      .json()
+      .catch(() => ({}));
+    const roadmapText = typeof generateData.generated_text === "string" ? generateData.generated_text : "";
     const lines = roadmapText
       .split(/\r?\n/)
       .map((l) => l.trim())
       .filter(Boolean)
-      .filter((l) => /^\d+\./.test(l));
+      .filter((l) => l.length >= 6);
 
-    const stages: RoadmapStage[] = lines.slice(0, 10).map((line: string, i: number) => {
+    const uniqueLines: string[] = [];
+    const seen = new Set<string>();
+    for (const raw of lines) {
+      const normalized = raw
+        .replace(/^\s*[-*]\s*/, '')
+        .replace(/^\s*\d+[).:-]?\s*/, '')
+        .replace(/^N\.\s*/i, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (!normalized) continue;
+      const key = normalized.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      uniqueLines.push(normalized);
+      if (uniqueLines.length >= targetCount) break;
+    }
+
+    const stages: RoadmapStage[] = uniqueLines.slice(0, targetCount).map((line: string, i: number) => {
+      const stageNumber = stageNumbers[i] || i + 1;
       const cleaned = line.replace(/^\d+\.\s*/, "");
       // Try to split `Title: objectives...` (fallback to whole line as title)
       const parts = cleaned.split(/\s*[:\-–—]\s*/, 2);
       const title = (parts[0] || cleaned).trim();
       const objectives = (parts[1] || "Core concepts and practice").trim();
       return {
-        id: `stage-${i}`,
+        id: `stage-${stageNumber}`,
         title,
         objectives,
-        difficulty: i < 3 ? "Beginner" : i < 7 ? "Intermediate" : "Advanced",
+        difficulty: stageDifficulty(stageNumber - 1),
+        band: stageBand(stageNumber - 1),
+        level,
       };
     });
 
-    if (stages.length === 0) {
-      return NextResponse.json({ error: "Roadmap generation returned no numbered items." }, { status: 502 });
+    if (stages.length < targetCount) {
+      const remainingStageNumbers = stageNumbers.slice(stages.length);
+      const fallbackStages = buildFallback(topic.trim(), level, todayTask, priority, remainingStageNumbers);
+      return NextResponse.json({ roadmap: [...stages, ...fallbackStages] });
     }
 
     return NextResponse.json({ roadmap: stages });
