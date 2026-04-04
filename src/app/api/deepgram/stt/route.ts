@@ -17,7 +17,7 @@ export async function POST(req: Request) {
       );
     }
 
-    const form = await req.formData();
+    const form: any = await req.formData();
     const file = form.get("audio");
     if (!(file instanceof File)) {
       return NextResponse.json({ error: "Missing audio file" }, { status: 400 });
