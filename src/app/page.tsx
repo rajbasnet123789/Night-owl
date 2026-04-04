@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type MouseEvent } from "react";
 import { useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
-import { Sparkles, BookOpen, Route, Loader2, CalendarDays, ChevronLeft, ChevronRight, Trophy } from "lucide-react";
+import { Sparkles, BookOpen, Route, Loader2, CalendarDays, ChevronLeft, ChevronRight, Trophy, Flame, Trash2, Plus, GraduationCap, BarChart3, Sun, Moon } from "lucide-react";
+import ThemeSwitcher from "@/components/ThemeSwitcher";
 import {
   getTodayDateKey,
   INTERVIEW_TASK_HISTORY_KEY,
@@ -127,13 +128,13 @@ const FLOATING_SHAPES = [
   { top: "74%", left: "82%", size: 160, duration: 18, delay: 1.8, tint: "from-cyan-400/10" },
 ] as const;
 
-function Panel3D({ children, className, delay = 0, onClick }: { children: ReactNode; className: string; delay?: number; onClick?: () => void }) {
+function Panel3D({ children, className, delay = 0, onClick, disableHover = false }: { children: ReactNode; className: string; delay?: number; onClick?: () => void; disableHover?: boolean }) {
   return (
     <motion.div
       initial={{ opacity: 0, y: 24, rotateX: 8 }}
       animate={{ opacity: 1, y: 0, rotateX: 0 }}
       transition={{ duration: 0.6, delay, ease: "easeOut" }}
-      whileHover={{ y: -8, rotateX: 6, rotateY: -6, scale: 1.01 }}
+      whileHover={disableHover ? undefined : { y: -8, rotateX: 6, rotateY: -6, scale: 1.01 }}
       style={{ transformStyle: "preserve-3d" }}
       onClick={onClick}
       className={`relative [perspective:1200px] ${className}`}
@@ -233,6 +234,7 @@ export default function Home() {
   const [isDateScheduleVisible, setIsDateScheduleVisible] = useState(false);
   const [isCalendarOpen, setIsCalendarOpen] = useState(false);
   const [isLeaderboardOpen, setIsLeaderboardOpen] = useState(false);
+  const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [activeMonth, setActiveMonth] = useState(() => {
     const now = new Date();
     return new Date(now.getFullYear(), now.getMonth(), 1);
@@ -354,6 +356,8 @@ export default function Home() {
       setLeaderboard(null);
       return;
     }
+    // Only poll when leaderboard panel is open
+    if (!isLeaderboardOpen) return;
 
     let active = true;
     let timer: number | null = null;
@@ -408,42 +412,50 @@ export default function Home() {
     };
 
     void pullLeaderboard(true);
+    // Poll every 30s instead of 12s, and only while panel is open
     timer = window.setInterval(() => {
       void pullLeaderboard(false);
-    }, 12000);
+    }, 30000);
 
     return () => {
       active = false;
       if (timer) window.clearInterval(timer);
     };
-  }, [authLoading, authUser, selectedLeaderboardSubject]);
+  }, [authLoading, authUser, selectedLeaderboardSubject, isLeaderboardOpen]);
 
-  const persistTodoSubjects = async (nextTodos: TodoSubject[]) => {
-    if (!authLoading && authUser) {
-      try {
-        const res = await fetch("/api/todos", {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ todos: nextTodos }),
-        });
-
-        const data = await res.json().catch(() => ({}));
-        if (res.ok) {
-          const normalized = normalizeTodoSubjects((data as { todos?: unknown }).todos);
-          setTodoSubjects(normalized);
-          return;
-        }
-      } catch {
-        // Fall through to local backup persistence.
-      }
-    }
-
+  const todoPersistTimerRef = useRef<number | null>(null);
+  const persistTodoSubjects = useCallback(async (nextTodos: TodoSubject[]) => {
+    // Always save locally immediately
     try {
       window.localStorage.setItem("study.todoSubjects", JSON.stringify(nextTodos));
     } catch {
       // ignore storage failures
     }
-  };
+
+    // Debounce the server PUT to avoid bursts on rapid toggling
+    if (todoPersistTimerRef.current) {
+      window.clearTimeout(todoPersistTimerRef.current);
+    }
+    todoPersistTimerRef.current = window.setTimeout(async () => {
+      if (!authLoading && authUser) {
+        try {
+          const res = await fetch("/api/todos", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ todos: nextTodos }),
+          });
+
+          const data = await res.json().catch(() => ({}));
+          if (res.ok) {
+            const normalized = normalizeTodoSubjects((data as { todos?: unknown }).todos);
+            setTodoSubjects(normalized);
+          }
+        } catch {
+          // Local backup already saved above
+        }
+      }
+    }, 600) as unknown as number;
+  }, [authLoading, authUser]);
 
   const allCalendarTasks = useMemo(() => {
     const interviewTasks: CalendarTask[] = taskHistory.map((task) => ({
@@ -572,6 +584,27 @@ export default function Home() {
     }));
   }, [selectedDateTasks]);
 
+  // 7-day trend data for progress visualization graph
+  const weeklyTrendData = useMemo(() => {
+    const data: { dateKey: string; label: string; completion: number; tasks: number }[] = [];
+    const selectedDate = new Date(selectedDateKey + "T00:00:00");
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date(selectedDate);
+      d.setDate(d.getDate() - i);
+      const dk = dateKeyFromDate(d);
+      const dayTasks = tasksByDate[dk] ?? [];
+      const done = dayTasks.filter((t) => t.status === "done").length;
+      const completion = dayTasks.length > 0 ? Math.round((done / dayTasks.length) * 100) : 0;
+      data.push({
+        dateKey: dk,
+        label: `${d.getDate()}/${d.getMonth() + 1}`,
+        completion,
+        tasks: dayTasks.length,
+      });
+    }
+    return data;
+  }, [selectedDateKey, tasksByDate]);
+
   const selectedLevelStageRange = stageRangeLabel(selectedLevel);
 
   const monthCells = useMemo(() => {
@@ -587,6 +620,29 @@ export default function Home() {
     }
     return cells;
   }, [activeMonth]);
+
+  const currentStreak = useMemo(() => {
+    let streak = 0;
+    const today = new Date();
+    // Only check as far back as there are task dates, max 365
+    const taskDateKeys = Object.keys(tasksByDate);
+    if (taskDateKeys.length === 0) return 0;
+    const maxDays = Math.min(365, taskDateKeys.length + 1);
+    
+    for (let i = 0; i < maxDays; i++) {
+      const checkDate = new Date(today);
+      checkDate.setDate(checkDate.getDate() - i);
+      const dateKey = dateKeyFromDate(checkDate);
+      
+      const dayTasks = tasksByDate[dateKey];
+      if (!dayTasks || !dayTasks.some((task) => task.status === "done")) {
+        break;
+      }
+      streak += 1;
+    }
+    
+    return streak;
+  }, [tasksByDate]);
 
   const handleLogout = async () => {
     try {
@@ -695,10 +751,13 @@ export default function Home() {
     void persistTodoSubjects(nextTodos);
   };
 
-  const handleResetAllData = async () => {
-    const confirmed = window.confirm("Reset all scheduled tasks, progress data, roadmap, and to-do items?");
-    if (!confirmed) return;
+  const removeTodoSubject = (id: string) => {
+    const nextTodos = todoSubjects.filter((item) => item.id !== id);
+    setTodoSubjects(nextTodos);
+    void persistTodoSubjects(nextTodos);
+  };
 
+  const handleResetAllData = async () => {
     setLoading(true);
     try {
       setRoadmap([]);
@@ -711,6 +770,7 @@ export default function Home() {
       setIsDateScheduleVisible(false);
       setSelectedLevel(null);
       setLevelError(null);
+      setShowResetConfirm(false);
 
       writeMentorshipTasks([]);
       writeInterviewTaskHistory([]);
@@ -770,11 +830,13 @@ export default function Home() {
             ThinkTrack
           </span>
         </div>
-        <div className="flex items-center gap-6">
+        <div className="flex items-center gap-5">
           <span onClick={() => setIsLeaderboardOpen(!isLeaderboardOpen)} className={`text-base font-medium cursor-pointer transition-colors ${isLeaderboardOpen ? "text-amber-400" : "text-slate-400 hover:text-white"}`}>Leaderboard</span>
           <span onClick={() => setIsCalendarOpen(!isCalendarOpen)} className={`text-base font-medium cursor-pointer transition-colors ${isCalendarOpen ? "text-cyan-400" : "text-slate-400 hover:text-white"}`}>Calendar</span>
           <span onClick={() => { setRoadmap([]); try { window.localStorage.removeItem("study.roadmap"); window.localStorage.removeItem("study.topic"); } catch {} router.push("/"); }} className="text-base font-medium text-slate-400 hover:text-white cursor-pointer transition-colors">Dashboard</span>
           <span onClick={() => router.push("/discussions")} className="text-base font-medium text-slate-400 hover:text-white cursor-pointer transition-colors">Discussions</span>
+          <div className="border-l border-white/10 h-6" />
+          <ThemeSwitcher />
           {authLoading ? null : authUser ? (
             <div className="flex items-center gap-3">
               <button
@@ -814,31 +876,70 @@ export default function Home() {
         <div className="w-full max-w-5xl mb-12 xl:mb-0 xl:h-0 xl:max-w-none">
           <div className="grid grid-cols-1 gap-6">
             {isCalendarOpen && (
-              <Panel3D className="group rounded-3xl border border-white/10 bg-white/[0.03] p-6 backdrop-blur max-w-md w-full mx-auto xl:fixed xl:right-6 xl:top-24 xl:z-40 xl:mx-0 xl:w-[420px] xl:max-w-[420px] xl:min-h-[520px]" delay={0.05} onClick={() => setIsDateScheduleVisible(false)}>
+              <Panel3D disableHover className="group rounded-3xl border border-white/10 bg-white/[0.03] p-6 backdrop-blur max-w-md w-full mx-auto xl:fixed xl:right-6 xl:top-24 xl:z-40 xl:mx-0 xl:w-[380px] xl:max-w-[380px]" delay={0.05}>
                 <div className="flex items-center justify-between mb-4">
-                <h3 className="text-sm font-bold tracking-widest uppercase text-cyan-300 flex items-center gap-2">
-                  <CalendarDays className="w-4 h-4" /> Task Calendar
-                </h3>
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => {
-                      const now = new Date();
-                      setActiveMonth(new Date(now.getFullYear(), now.getMonth(), 1));
-                      setSelectedDateKey(todayDateKey);
-                      setIsDateScheduleVisible(true);
-                    }}
-                    className="text-xs font-bold uppercase tracking-widest px-3 py-1.5 rounded-full border border-white/10 bg-white/5 hover:bg-white/10"
-                  >
-                    Today
-                  </button>
-                  <button
-                    onClick={() => void handleResetAllData()}
-                    className="text-xs font-bold uppercase tracking-widest px-3 py-1.5 rounded-full border border-rose-400/50 bg-rose-500/10 text-rose-200 hover:bg-rose-500/20"
-                  >
-                    Reset All
-                  </button>
+                  <h3 className="text-sm font-bold tracking-widest uppercase text-cyan-300 flex items-center gap-2">
+                    <CalendarDays className="w-4 h-4" /> Task Calendar
+                  </h3>
+                  <div className="flex items-center gap-3">
+                    {currentStreak > 0 && (
+                      <motion.div
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-gradient-to-r from-orange-500/50 to-red-500/50 border border-orange-400/50 backdrop-blur"
+                        animate={{ scale: [1, 1.1, 1] }}
+                        transition={{ duration: 2, repeat: Infinity }}
+                      >
+                        <Flame className="w-4 h-4 text-orange-300" />
+                        <span className="text-sm font-bold text-orange-100">{currentStreak}</span>
+                      </motion.div>
+                    )}
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          const now = new Date();
+                          setActiveMonth(new Date(now.getFullYear(), now.getMonth(), 1));
+                          setSelectedDateKey(todayDateKey);
+                          setIsDateScheduleVisible(true);
+                        }}
+                        className="text-xs font-bold uppercase tracking-widest px-3 py-1.5 rounded-full border border-white/10 bg-white/5 hover:bg-white/10"
+                      >
+                        Today
+                      </button>
+                      {showResetConfirm ? (
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void handleResetAllData();
+                            }}
+                            className="text-[10px] font-bold uppercase tracking-widest px-2.5 py-1.5 rounded-full border border-red-400/70 bg-red-500/20 text-red-200 hover:bg-red-500/40 transition-colors"
+                          >
+                            Confirm
+                          </button>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setShowResetConfirm(false);
+                            }}
+                            className="text-[10px] font-bold uppercase tracking-widest px-2.5 py-1.5 rounded-full border border-white/10 bg-white/5 hover:bg-white/10 text-slate-400 transition-colors"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setShowResetConfirm(true);
+                          }}
+                          className="text-xs font-bold uppercase tracking-widest px-3 py-1.5 rounded-full border border-rose-400/50 bg-rose-500/10 text-rose-200 hover:bg-rose-500/20"
+                        >
+                          Reset All
+                        </button>
+                      )}
+                    </div>
+                  </div>
                 </div>
-              </div>
 
               <div className="flex items-center justify-between mb-4">
                 <button
@@ -874,7 +975,8 @@ export default function Home() {
                   return (
                     <button
                       key={cell.dateKey}
-                      onClick={() => {
+                      onClick={(e: MouseEvent<HTMLButtonElement>) => {
+                        e.stopPropagation();
                         if (cell.dateKey === selectedDateKey) {
                           setIsDateScheduleVisible((prev) => !prev);
                           return;
@@ -1015,104 +1117,322 @@ export default function Home() {
             </Panel3D>
             )}
 
-            {isCalendarOpen && (isDateScheduleVisible ? (
-              <Panel3D className="group rounded-3xl border border-white/10 bg-white/[0.03] p-6 backdrop-blur xl:fixed xl:right-6 xl:top-[580px] xl:z-40 xl:w-[420px] xl:max-h-[44vh] xl:overflow-y-auto" delay={0.1}>
-                <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 mb-4">
-                  <h3 className="text-sm font-bold tracking-widest uppercase text-emerald-300">
-                    Date Schedule: {formatDateKeyLabel(selectedDateKey)}
-                  </h3>
-                  <span className="text-sm font-semibold text-cyan-300">Overall Progress: {selectedDateOverallProgress}%</span>
-                </div>
+            {isCalendarOpen && (
+              <AnimatePresence mode="wait">
+                {isDateScheduleVisible ? (
+                  <motion.div
+                    key="date-schedule"
+                    initial={{ opacity: 0, y: 16, scale: 0.97 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={{ opacity: 0, y: 10, scale: 0.97 }}
+                    transition={{ duration: 0.3, ease: "easeOut" }}
+                  >
+                    <Panel3D className="group rounded-3xl border border-white/15 bg-slate-900/95 backdrop-blur-xl p-6 shadow-2xl shadow-black/40 xl:fixed xl:right-[400px] xl:top-24 xl:z-40 xl:w-[420px] xl:max-h-[85vh] xl:overflow-y-auto" delay={0.1}>
+                      <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 mb-4">
+                        <h3 className="text-sm font-bold tracking-widest uppercase text-emerald-300">
+                          {formatDateKeyLabel(selectedDateKey)}
+                        </h3>
+                        <button
+                          onClick={() => setIsDateScheduleVisible(false)}
+                          className="text-xs font-bold uppercase tracking-widest px-3 py-1.5 rounded-full border border-white/10 bg-white/5 hover:bg-white/10 text-slate-400 hover:text-white transition-colors"
+                        >
+                          Close
+                        </button>
+                      </div>
 
-                <div className="grid grid-cols-2 gap-2 mb-4">
-                  <div className="rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-xs text-slate-300">
-                    Scheduled: <span className="text-slate-100 font-semibold">{selectedDateTasks.length}</span>
-                  </div>
-                  <div className="rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-xs text-slate-300">
-                    Completed: <span className="text-slate-100 font-semibold">{selectedCompletedTasks.length}</span>
-                  </div>
-                  <div className="rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-xs text-slate-300">
-                    Pending: <span className="text-slate-100 font-semibold">{selectedPendingTasks.length}</span>
-                  </div>
-                  <div className="rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-xs text-slate-300">
-                    Task Completion: <span className="text-slate-100 font-semibold">{selectedDateCompletionPercent}%</span>
-                  </div>
-                  <div className="rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-xs text-slate-300">
-                    Assessment Progress: <span className="text-slate-100 font-semibold">{selectedAssessmentProgressPercent}%</span>
-                  </div>
-                  <div className="rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-xs text-slate-300">
-                    Interview Progress: <span className="text-slate-100 font-semibold">{selectedInterviewProgressPercent}%</span>
-                  </div>
-                  <div className="rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-xs text-slate-300">
-                    Quality Score: <span className="text-slate-100 font-semibold">{selectedDateAcademicScore}/100</span>
-                  </div>
-                </div>
+                      {/* ━━━ Progress Visualization Graph ━━━ */}
+                      <div className="rounded-2xl border border-white/10 bg-black/20 p-4 mb-4">
+                        <div className="flex items-center gap-2 mb-3">
+                          <BarChart3 className="w-4 h-4 text-cyan-400" />
+                          <span className="text-xs font-bold uppercase tracking-widest text-cyan-300">Progress Overview</span>
+                        </div>
 
-                <div className="rounded-2xl border border-cyan-500/20 bg-cyan-500/10 px-4 py-3 text-sm text-slate-200 mb-4">
-                  {selectedDateProgressReport}
-                </div>
-
-                {selectedDateTasks.length === 0 ? (
-                  <p className="rounded-xl border border-white/10 bg-black/20 px-4 py-3 text-sm text-slate-400">
-                    No tasks scheduled for this date yet.
-                  </p>
-                ) : (
-                  <div className="space-y-4">
-                    {selectedDateScheduleByBucket
-                      .filter((bucket) => bucket.tasks.length > 0)
-                      .map((bucket) => {
-                        const bucketCompleted = bucket.tasks.filter((task) => task.status === "done").length;
-                        const bucketCompletion = Math.round((bucketCompleted / bucket.tasks.length) * 100);
-
-                        return (
-                          <div key={bucket.key} className="rounded-2xl border border-white/10 bg-black/20 px-4 py-3">
-                            <div className="flex items-center justify-between gap-3 mb-3">
-                              <p className="text-sm font-semibold text-cyan-300">
-                                {bucket.key} Window ({bucket.range})
-                              </p>
-                              <p className="text-xs text-slate-300">
-                                {bucketCompleted}/{bucket.tasks.length} done ({bucketCompletion}%)
-                              </p>
-                            </div>
-
-                            <div className="space-y-2">
-                              {bucket.tasks.map((task) => (
-                                <div
-                                  key={task.id}
-                                  onClick={() => {
-                                    if (task.source === "mentorship" && task.stageId) {
-                                      router.push(`/stage/${task.stageId}`);
-                                    } else if (task.source === "interview") {
-                                      router.push("/interview");
-                                    }
-                                  }}
-                                  className={`flex items-center justify-between gap-3 rounded-xl border border-white/10 bg-black/20 px-3 py-2 ${
-                                    (task.source === "mentorship" && task.stageId) || task.source === "interview"
-                                      ? "cursor-pointer hover:bg-white/10 hover:border-cyan-400/30 transition-colors"
-                                      : ""
-                                  }`}
-                                >                                  <div>
-                                    <p className="text-sm text-slate-100 font-semibold">{task.title}</p>
-                                    <p className="text-xs text-slate-500">{task.topic} • {formatUtcTime(task.createdAt)} UTC</p>
-                                  </div>
-                                  <div className="text-right">
-                                    <p className="text-xs text-slate-300">{task.status === "done" ? "Completed" : "Pending"}</p>
-                                    <p className="text-[11px] text-cyan-300">{task.progressPercent}% complete</p>
-                                  </div>
-                                </div>
-                              ))}
+                        {/* Overall progress ring + percentage */}
+                        <div className="flex items-center gap-5 mb-4">
+                          <div className="relative w-16 h-16 shrink-0">
+                            <svg viewBox="0 0 64 64" className="w-full h-full -rotate-90">
+                              <circle cx="32" cy="32" r="26" fill="none" stroke="rgba(255,255,255,0.06)" strokeWidth="6" />
+                              <motion.circle
+                                cx="32" cy="32" r="26" fill="none"
+                                stroke="url(#progressGrad)"
+                                strokeWidth="6"
+                                strokeLinecap="round"
+                                strokeDasharray={`${2 * Math.PI * 26}`}
+                                initial={{ strokeDashoffset: 2 * Math.PI * 26 }}
+                                animate={{ strokeDashoffset: 2 * Math.PI * 26 * (1 - selectedDateOverallProgress / 100) }}
+                                transition={{ duration: 0.8, ease: "easeOut" }}
+                              />
+                              <defs>
+                                <linearGradient id="progressGrad" x1="0" y1="0" x2="1" y2="1">
+                                  <stop offset="0%" stopColor="#06b6d4" />
+                                  <stop offset="100%" stopColor="#818cf8" />
+                                </linearGradient>
+                              </defs>
+                            </svg>
+                            <div className="absolute inset-0 flex items-center justify-center">
+                              <span className="text-sm font-black text-white">{selectedDateOverallProgress}%</span>
                             </div>
                           </div>
-                        );
-                      })}
-                  </div>
+                          <div className="flex-1 min-w-0">
+                            <p className="text-sm font-semibold text-white mb-1">Overall Progress</p>
+                            <p className="text-xs text-slate-400 leading-relaxed">
+                              {selectedDateProgressReport}
+                            </p>
+                          </div>
+                        </div>
+
+                        {/* Metric bars */}
+                        {[
+                          { label: "Task Completion", value: selectedDateCompletionPercent, color: "from-cyan-400 to-teal-300", bgTrack: "bg-cyan-950/60", dot: "bg-cyan-400", shadow: "shadow-[0_0_10px_rgba(6,182,212,0.5)]" },
+                          { label: "Assessment", value: selectedAssessmentProgressPercent, color: "from-violet-500 to-purple-400", bgTrack: "bg-violet-950/60", dot: "bg-violet-400", shadow: "shadow-[0_0_10px_rgba(139,92,246,0.5)]" },
+                          { label: "Interview", value: selectedInterviewProgressPercent, color: "from-emerald-400 to-green-300", bgTrack: "bg-emerald-950/60", dot: "bg-emerald-400", shadow: "shadow-[0_0_10px_rgba(52,211,153,0.5)]" },
+                          { label: "Quality Score", value: selectedDateAcademicScore, color: "from-amber-400 to-orange-300", bgTrack: "bg-amber-950/60", dot: "bg-amber-400", shadow: "shadow-[0_0_10px_rgba(251,191,36,0.5)]" },
+                        ].map((metric) => (
+                          <div key={metric.label} className="mb-3.5 last:mb-0">
+                            <div className="flex items-center justify-between mb-1.5">
+                              <div className="flex items-center gap-2">
+                                <div className={`w-3 h-3 rounded-full ${metric.dot} ${metric.shadow}`} />
+                                <span className="text-xs font-bold text-slate-200">{metric.label}</span>
+                              </div>
+                              <span className={`text-sm font-black ${metric.value > 0 ? "text-white" : "text-slate-500"}`}>{metric.value}%</span>
+                            </div>
+                            <div className={`h-4 rounded-full ${metric.bgTrack} overflow-hidden border border-white/10`}>
+                              {metric.value > 0 ? (
+                                <motion.div
+                                  className={`h-full rounded-full bg-gradient-to-r ${metric.color} ${metric.shadow}`}
+                                  initial={{ width: 0 }}
+                                  animate={{ width: `${Math.max(metric.value, 5)}%` }}
+                                  transition={{ duration: 0.8, ease: "easeOut", delay: 0.15 }}
+                                />
+                              ) : (
+                                <div className="h-full w-full flex items-center justify-center">
+                                  <span className="text-[8px] font-bold text-slate-600 uppercase tracking-widest">No data</span>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+
+                      {/* ━━━ 7-Day Productivity Bar Graph ━━━ */}
+                      <div className="rounded-2xl border border-white/10 bg-black/20 p-4 mb-4">
+                        <div className="flex items-center justify-between mb-4">
+                          <span className="text-xs font-bold uppercase tracking-widest text-indigo-300">7-Day Productivity</span>
+                          <span className="text-[10px] text-slate-500">Completion %</span>
+                        </div>
+
+                        {/* Y-axis labels + Bars */}
+                        <div className="flex gap-2">
+                          {/* Y-axis */}
+                          <div className="flex flex-col justify-between h-40 text-[9px] font-semibold text-slate-500 pr-1 shrink-0">
+                            <span>100</span>
+                            <span>75</span>
+                            <span>50</span>
+                            <span>25</span>
+                            <span>0</span>
+                          </div>
+
+                          {/* Bars container */}
+                          <div className="flex-1 relative">
+                            {/* Grid lines */}
+                            <div className="absolute inset-0 flex flex-col justify-between pointer-events-none">
+                              {[0, 1, 2, 3, 4].map((i) => (
+                                <div key={`hgrid-${i}`} className="border-b border-white/[0.08]" />
+                              ))}
+                            </div>
+
+                            {/* Bars */}
+                            <div className="relative h-40 flex items-end justify-between gap-2 px-1">
+                              {weeklyTrendData.map((d, i) => {
+                                const isSelected = d.dateKey === selectedDateKey;
+                                const barHeight = d.completion > 0 ? Math.max(d.completion, 8) : 4;
+                                const barColor = d.completion >= 70
+                                  ? "from-emerald-400 to-emerald-300"
+                                  : d.completion >= 30
+                                    ? "from-amber-400 to-yellow-300"
+                                    : d.completion > 0
+                                      ? "from-rose-400 to-rose-300"
+                                      : "from-slate-700 to-slate-600";
+                                const glowColor = d.completion >= 70
+                                  ? "shadow-[0_0_14px_rgba(52,211,153,0.4)]"
+                                  : d.completion >= 30
+                                    ? "shadow-[0_0_14px_rgba(251,191,36,0.4)]"
+                                    : "shadow-none";
+
+                                return (
+                                  <div key={d.dateKey} className="flex-1 flex flex-col items-center">
+                                    {/* Background column */}
+                                    <div className={`w-full h-full rounded-lg ${isSelected ? "bg-cyan-500/[0.06]" : "bg-white/[0.02]"} flex items-end`}>
+                                      <motion.div
+                                        className={`w-full rounded-lg bg-gradient-to-t ${barColor} ${isSelected ? glowColor : ""} relative group cursor-default ${
+                                          isSelected ? "ring-2 ring-cyan-400/70 ring-offset-1 ring-offset-transparent" : ""
+                                        }`}
+                                        initial={{ height: 0, opacity: 0 }}
+                                        animate={{ height: `${barHeight}%`, opacity: 1 }}
+                                        transition={{ duration: 0.6, ease: "easeOut", delay: 0.1 + i * 0.07 }}
+                                        style={{ minHeight: d.completion > 0 ? "10px" : "5px" }}
+                                      >
+                                        {/* Tooltip on hover */}
+                                        <div className="absolute -top-7 left-1/2 -translate-x-1/2 px-2 py-1 rounded-lg bg-slate-800 border border-white/15 text-[10px] font-bold text-white opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none z-10 shadow-lg">
+                                          {d.completion}%
+                                        </div>
+                                      </motion.div>
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* X-axis date labels */}
+                        <div className="flex gap-2 mt-2">
+                          <div className="w-6 shrink-0" />
+                          <div className="flex-1 flex justify-between px-1">
+                            {weeklyTrendData.map((d) => (
+                              <span
+                                key={d.dateKey}
+                                className={`text-[9px] font-bold text-center flex-1 ${
+                                  d.dateKey === selectedDateKey ? "text-cyan-300" : "text-slate-500"
+                                }`}
+                              >
+                                {d.label}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+
+                        {/* Legend */}
+                        <div className="flex items-center justify-center gap-4 mt-3 pt-3 border-t border-white/[0.06]">
+                          <div className="flex items-center gap-1.5">
+                            <div className="w-2.5 h-2.5 rounded-sm bg-gradient-to-t from-emerald-400 to-emerald-300" />
+                            <span className="text-[9px] font-semibold text-slate-500">Good (≥70%)</span>
+                          </div>
+                          <div className="flex items-center gap-1.5">
+                            <div className="w-2.5 h-2.5 rounded-sm bg-gradient-to-t from-amber-400 to-yellow-300" />
+                            <span className="text-[9px] font-semibold text-slate-500">Fair (30-69%)</span>
+                          </div>
+                          <div className="flex items-center gap-1.5">
+                            <div className="w-2.5 h-2.5 rounded-sm bg-gradient-to-t from-rose-400 to-rose-300" />
+                            <span className="text-[9px] font-semibold text-slate-500">Low (&lt;30%)</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* ━━━ Stats Summary ━━━ */}
+                      <div className="grid grid-cols-3 gap-2 mb-4">
+                        <div className="rounded-xl border border-white/10 bg-black/20 px-3 py-2.5 text-center">
+                          <p className="text-lg font-black text-white">{selectedDateTasks.length}</p>
+                          <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-widest">Scheduled</p>
+                        </div>
+                        <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 px-3 py-2.5 text-center">
+                          <p className="text-lg font-black text-emerald-300">{selectedCompletedTasks.length}</p>
+                          <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-widest">Completed</p>
+                        </div>
+                        <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 px-3 py-2.5 text-center">
+                          <p className="text-lg font-black text-amber-300">{selectedPendingTasks.length}</p>
+                          <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-widest">Pending</p>
+                        </div>
+                      </div>
+
+                      {/* ━━━ Task Timeline ━━━ */}
+                      {selectedDateTasks.length === 0 ? (
+                        <div className="rounded-2xl border border-dashed border-white/15 bg-white/[0.02] px-6 py-8 text-center">
+                          <CalendarDays className="w-8 h-8 mx-auto mb-2 text-slate-600" />
+                          <p className="text-sm text-slate-400">No tasks scheduled for this date yet.</p>
+                        </div>
+                      ) : (
+                        <div className="space-y-4">
+                          {selectedDateScheduleByBucket
+                            .filter((bucket) => bucket.tasks.length > 0)
+                            .map((bucket) => {
+                              const bucketCompleted = bucket.tasks.filter((task) => task.status === "done").length;
+                              const bucketCompletion = Math.round((bucketCompleted / bucket.tasks.length) * 100);
+
+                              return (
+                                <div key={bucket.key} className="rounded-2xl border border-white/10 bg-black/20 px-4 py-3">
+                                  <div className="flex items-center justify-between gap-3 mb-2">
+                                    <p className="text-sm font-semibold text-cyan-300">
+                                      {bucket.key} ({bucket.range})
+                                    </p>
+                                    <p className="text-xs text-slate-300">
+                                      {bucketCompleted}/{bucket.tasks.length} done
+                                    </p>
+                                  </div>
+                                  {/* Bucket progress bar */}
+                                  <div className="h-1 rounded-full bg-white/5 overflow-hidden mb-3">
+                                    <motion.div
+                                      className="h-full rounded-full bg-gradient-to-r from-cyan-500 to-indigo-500"
+                                      initial={{ width: 0 }}
+                                      animate={{ width: `${bucketCompletion}%` }}
+                                      transition={{ duration: 0.5, ease: "easeOut" }}
+                                    />
+                                  </div>
+
+                                  <div className="space-y-2">
+                                    {bucket.tasks.map((task) => (
+                                      <div
+                                        key={task.id}
+                                        onClick={() => {
+                                          if (task.source === "mentorship" && task.stageId) {
+                                            router.push(`/stage/${task.stageId}`);
+                                          } else if (task.source === "interview") {
+                                            router.push("/interview");
+                                          }
+                                        }}
+                                        className={`flex items-center justify-between gap-3 rounded-xl border px-3 py-2.5 transition-all duration-200 ${
+                                          task.status === "done"
+                                            ? "border-emerald-500/20 bg-emerald-500/[0.04]"
+                                            : "border-white/10 bg-black/20"
+                                        } ${
+                                          (task.source === "mentorship" && task.stageId) || task.source === "interview"
+                                            ? "cursor-pointer hover:bg-white/10 hover:border-cyan-400/30"
+                                            : ""
+                                        }`}
+                                      >
+                                        <div className="flex items-center gap-3 min-w-0">
+                                          <div className={`w-2 h-2 rounded-full shrink-0 ${
+                                            task.status === "done" ? "bg-emerald-400" : "bg-amber-400 animate-pulse"
+                                          }`} />
+                                          <div className="min-w-0">
+                                            <p className="text-sm text-slate-100 font-semibold truncate">{task.title}</p>
+                                            <p className="text-[11px] text-slate-500 truncate">{task.topic} • {formatUtcTime(task.createdAt)}</p>
+                                          </div>
+                                        </div>
+                                        <div className="text-right shrink-0">
+                                          <span className={`text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded-full ${
+                                            task.status === "done"
+                                              ? "bg-emerald-500/20 text-emerald-300"
+                                              : "bg-amber-500/20 text-amber-300"
+                                          }`}>
+                                            {task.status === "done" ? "Done" : "Pending"}
+                                          </span>
+                                        </div>
+                                      </div>
+                                    ))}
+                                  </div>
+                                </div>
+                              );
+                            })}
+                        </div>
+                      )}
+                    </Panel3D>
+                  </motion.div>
+                ) : (
+                  <motion.div
+                    key="date-placeholder"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    transition={{ duration: 0.2 }}
+                  >
+                    <Panel3D className="group rounded-2xl border border-dashed border-white/20 bg-white/[0.02] px-4 py-6 text-center text-sm text-slate-400 xl:fixed xl:right-[400px] xl:top-24 xl:z-40 xl:w-[420px]" delay={0.1}>
+                      Click any date to view schedule and progress details. Click the same date again to hide.
+                    </Panel3D>
+                  </motion.div>
                 )}
-              </Panel3D>
-            ) : (
-              <Panel3D className="group rounded-2xl border border-dashed border-white/20 bg-white/[0.02] px-4 py-6 text-center text-sm text-slate-400 xl:fixed xl:right-6 xl:top-[580px] xl:z-40 xl:w-[420px]" delay={0.1}>
-                Click any date to view schedule and progress details. Click the same date again to hide.
-              </Panel3D>
-            ))}
+              </AnimatePresence>
+            )}
           </div>
 
         </div>
@@ -1144,9 +1464,35 @@ export default function Home() {
 
               <Panel3D className="group w-full max-w-4xl rounded-2xl border border-white/10 bg-white/5 p-5" delay={0.15}>
                 <div className="flex items-center justify-between gap-3 mb-4">
-                  <p className="text-sm font-bold uppercase tracking-widest text-slate-400">Today To-Do Subjects</p>
-                  <span className="text-[11px] text-slate-500">Roadmap depth: {selectedLevel ?? "Not selected"} ({selectedLevelStageRange})</span>
+                  <div className="flex items-center gap-3">
+                    <div className="p-2 rounded-xl bg-gradient-to-br from-cyan-500/20 to-indigo-500/20 border border-cyan-500/20">
+                      <GraduationCap className="w-5 h-5 text-cyan-400" />
+                    </div>
+                    <p className="text-sm font-bold uppercase tracking-widest text-slate-400">Today To-Do Subjects</p>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    {todoSubjects.length > 0 && (
+                      <span className="text-[11px] font-bold px-3 py-1.5 rounded-full border border-cyan-500/30 bg-cyan-500/10 text-cyan-300">
+                        {todoSubjects.filter((t) => t.done).length}/{todoSubjects.length} done
+                      </span>
+                    )}
+                    <span className="text-[11px] text-slate-500">Roadmap depth: {selectedLevel ?? "Not selected"} ({selectedLevelStageRange})</span>
+                  </div>
                 </div>
+
+                {/* Progress bar */}
+                {todoSubjects.length > 0 && (
+                  <div className="mb-4">
+                    <div className="h-1.5 rounded-full bg-white/5 overflow-hidden">
+                      <motion.div
+                        className="h-full rounded-full bg-gradient-to-r from-cyan-500 to-indigo-500"
+                        initial={{ width: 0 }}
+                        animate={{ width: `${Math.round((todoSubjects.filter((t) => t.done).length / todoSubjects.length) * 100)}%` }}
+                        transition={{ duration: 0.6, ease: "easeOut" }}
+                      />
+                    </div>
+                  </div>
+                )}
 
                 <div className="mb-4">
                   <p className="text-xs font-bold uppercase tracking-widest text-slate-400 mb-2">Select Level First</p>
@@ -1158,10 +1504,10 @@ export default function Home() {
                           setSelectedLevel(level);
                           setLevelError(null);
                         }}
-                        className={`rounded-xl border px-3 py-2 text-xs font-bold uppercase tracking-widest transition-colors ${
+                        className={`rounded-xl border px-3 py-2 text-xs font-bold uppercase tracking-widest transition-all duration-200 ${
                           selectedLevel === level
-                            ? "border-cyan-400/70 bg-cyan-500/20 text-cyan-200"
-                            : "border-white/10 bg-white/5 text-slate-300 hover:bg-white/10"
+                            ? "border-cyan-400/70 bg-cyan-500/20 text-cyan-200 shadow-[0_0_12px_rgba(6,182,212,0.15)]"
+                            : "border-white/10 bg-white/5 text-slate-300 hover:bg-white/10 hover:border-white/20"
                         }`}
                       >
                         {level}
@@ -1184,45 +1530,100 @@ export default function Home() {
                       if (e.key === "Enter") handleAddTodoSubject();
                     }}
                     placeholder="Add subject (e.g. Python, System Design, DSA)"
-                    className="flex-1 bg-black/30 border border-white/10 rounded-xl px-4 py-3 text-base text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-cyan-500"
+                    className="flex-1 bg-black/30 border border-white/10 rounded-xl px-4 py-3 text-base text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-cyan-500/40 transition-shadow"
                   />
                   <button
                     onClick={handleAddTodoSubject}
-                    className="rounded-xl border border-cyan-400/60 bg-cyan-500/20 hover:bg-cyan-500/30 px-6 py-3 text-sm font-bold uppercase tracking-widest text-cyan-200 transition-colors"
+                    className="rounded-xl border border-cyan-400/60 bg-gradient-to-r from-cyan-500/20 to-indigo-500/20 hover:from-cyan-500/30 hover:to-indigo-500/30 px-6 py-3 text-sm font-bold uppercase tracking-widest text-cyan-200 transition-all flex items-center gap-2 justify-center"
                   >
-                    Add
+                    <Plus className="w-4 h-4" /> Add
                   </button>
                 </div>
 
                 <div className="mt-4 space-y-2">
                   {todoSubjects.length === 0 ? (
-                    <p className="rounded-xl border border-white/10 bg-black/20 px-4 py-3 text-sm text-slate-400">
-                      Add a subject, then click it to generate your roadmap.
-                    </p>
+                    <motion.div
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      className="rounded-2xl border border-dashed border-white/15 bg-gradient-to-br from-white/[0.02] to-white/[0.04] px-6 py-8 text-center"
+                    >
+                      <GraduationCap className="w-10 h-10 mx-auto mb-3 text-slate-600" />
+                      <p className="text-sm text-slate-400">Add a subject, then click it to generate your roadmap.</p>
+                    </motion.div>
                   ) : (
-                    todoSubjects.map((item) => (
-                      <div
-                        key={item.id}
-                        className="flex items-center gap-3 rounded-xl border border-white/10 bg-black/20 px-4 py-3"
-                      >
-                        <input
-                          type="checkbox"
-                          checked={item.done}
-                          onChange={(e) => toggleTodoSubject(item.id, e.target.checked)}
-                          className="h-4 w-4 accent-cyan-400"
-                        />
-                        <button
-                          onClick={() => handleGenerateForSubject(item.subject)}
-                          disabled={loading}
-                          className={`flex-1 text-left text-base transition-colors ${
-                            item.done ? "text-slate-500 line-through" : "text-slate-100 hover:text-cyan-300"
-                          } ${loading ? "opacity-60 cursor-not-allowed" : ""}`}
+                    <AnimatePresence mode="popLayout">
+                      {todoSubjects.map((item, idx) => (
+                        <motion.div
+                          key={item.id}
+                          layout
+                          initial={{ opacity: 0, x: -20, scale: 0.95 }}
+                          animate={{ opacity: 1, x: 0, scale: 1 }}
+                          exit={{ opacity: 0, x: 30, scale: 0.9 }}
+                          transition={{ duration: 0.25, delay: idx * 0.03 }}
+                          className={`group/item flex items-center gap-3 rounded-xl border px-4 py-3.5 transition-all duration-200 ${
+                            item.done
+                              ? "border-emerald-500/20 bg-emerald-500/[0.04]"
+                              : "border-white/10 bg-black/20 hover:border-cyan-500/30 hover:bg-cyan-500/[0.04]"
+                          }`}
                         >
-                          {item.subject}
-                        </button>
-                        {loading ? <Loader2 className="w-4 h-4 animate-spin text-cyan-300" /> : null}
-                      </div>
-                    ))
+                          <label className="relative flex items-center justify-center cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={item.done}
+                              onChange={(e) => toggleTodoSubject(item.id, e.target.checked)}
+                              className="sr-only peer"
+                            />
+                            <div className={`w-5 h-5 rounded-lg border-2 flex items-center justify-center transition-all duration-200 ${
+                              item.done
+                                ? "border-emerald-400 bg-emerald-500/30"
+                                : "border-white/20 bg-black/30 peer-hover:border-cyan-400/50"
+                            }`}>
+                              {item.done && (
+                                <motion.svg
+                                  initial={{ scale: 0 }}
+                                  animate={{ scale: 1 }}
+                                  transition={{ type: "spring", stiffness: 400, damping: 15 }}
+                                  className="w-3 h-3 text-emerald-300"
+                                  fill="none"
+                                  viewBox="0 0 24 24"
+                                  stroke="currentColor"
+                                  strokeWidth={3}
+                                >
+                                  <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                                </motion.svg>
+                              )}
+                            </div>
+                          </label>
+
+                          <button
+                            onClick={() => handleGenerateForSubject(item.subject)}
+                            disabled={loading}
+                            className={`flex-1 text-left text-base transition-all duration-200 ${
+                              item.done
+                                ? "text-slate-500 line-through decoration-emerald-500/40"
+                                : "text-slate-100 hover:text-cyan-300"
+                            } ${loading ? "opacity-60 cursor-not-allowed" : ""}`}
+                          >
+                            {item.subject}
+                          </button>
+
+                          {loading && !item.done ? (
+                            <Loader2 className="w-4 h-4 animate-spin text-cyan-300 shrink-0" />
+                          ) : (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                removeTodoSubject(item.id);
+                              }}
+                              className="p-1.5 rounded-lg opacity-0 group-hover/item:opacity-100 transition-all duration-200 hover:bg-rose-500/20 text-slate-500 hover:text-rose-400"
+                              title="Remove subject"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          )}
+                        </motion.div>
+                      ))}
+                    </AnimatePresence>
                   )}
                 </div>
               </Panel3D>
