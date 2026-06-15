@@ -1,0 +1,16 @@
+{
+  "name": "night-owl",
+  "version": "1.0.0",
+  "description": "Full stack configuration for the NightOwl assessment system",
+  "scripts": {
+    "install:backend": "cd backend && uv sync",
+    "install:frontend": "cd frontend && npm install",
+    "install:all": "npm install && npm run install:frontend",
+    "start:backend": "cd backend && .venv\\Scripts\\python.exe server.py",
+    "start:frontend": "cd frontend && npm run dev",
+    "dev": "concurrently --kill-others \"npm run start:backend\" \"npm run start:frontend\""
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  }
+}

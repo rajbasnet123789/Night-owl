@@ -1,7 +1,13 @@
+transformers 
+accelerate
+deepgram-sdk
+gtts
+pydub
 langgraph
-ipykernel
-tavily-python
+langchain-core
+huggingface-hub
 python-dotenv
-huggingface_hub==0.36.2
---prerelease=allow moshi
-sounddevice
+tavily-python
+pydantic
+asyncio
+dataclasses
